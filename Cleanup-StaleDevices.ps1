@@ -48,7 +48,7 @@ Removes stale device from Entra - Run this at your own risk!
         CSV file export feature
 
 .VERSION
-    0.9.3
+    0.9.4
 
 .AUTHOR
     Kasper Johansen 
@@ -64,11 +64,13 @@ Removes stale device from Entra - Run this at your own risk!
     25-04-2024 - 0.9 - Script is in BETA, still testing stuff
     26-04-2024 - 0.9.2 - Parts of the script has been rewritten, see change log for additional information
     27-04-2024 - 0.9.3 - It's now possible to export af list of stale devices to a CSV file
+    27-04-2024 - 0.9.4 - Code cleanup
 
 .CHANGELOG
-    0.9 - Latest BETA version
+    0.9.0 - Latest BETA version
     0.9.2 - Get-StaleDevices function rewritten to use filtering instead of where-object, this change has made the script almost 50% faster
     0.9.3 - Added CSV export feature
+    0.9.4 - Code cleanup. Removed unused parts of the code
 #>
 
 param(
@@ -92,9 +94,6 @@ function Get-StaleDevices
             [string]$JoinType,
             [switch]$DisabledDevices
     )
-    # Convert date/time to ISO8601 format
-    #[string]$Days = Get-Date (Get-Date).AddDays(-$Age) -UFormat '+%Y-%m-%dT%H:%M:%SZ'
-
     If ($DisabledDevices)
     {
         Get-MgDevice -All -Filter "OperatingSystem eq 'Windows' AND TrustType eq '$JoinType' AND AccountEnabled eq false"    
@@ -105,6 +104,7 @@ function Get-StaleDevices
 }
 
 #Region Install and import Powershell module
+# Download and install require Powershell modules
 Write-Host "Downloading and installing Powershell modules" -ForegroundColor Cyan
 Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
 Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
@@ -118,7 +118,7 @@ $RequiredScopes = "Device.ReadWrite.All"
 Connect-MgGraph -Scopes $RequiredScopes -TenantId $TenantID -NoWelcome
 
 #Region Get devices
-# Get all devices
+# Get stale devices
 Write-Host "Enumerating stale devices" -ForegroundColor Cyan
 $StaleDevices = Get-StaleDevices -Age $DeviceAge -JoinType $DeviceJoinType
 
@@ -151,9 +151,7 @@ If ($DisableDevice)
             Write-Host "Disable device - $($Device.Displayname)"
             Update-MgDevice -DeviceId $($Device.Id) -BodyParameter $params -WhatIf
         }
-                #$DisabledDevices = Get-MgDevice -All | Where-Object {$_.OperatingSystem -eq "Windows" -and $_.TrustType -eq $DeviceJoinType -and $_.AccountEnabled -eq "false"}
                 $DisabledDevices = Get-StaleDevices -JoinType $DeviceJoinType -DisabledDevices
-                #$DisabledDevices | select-object DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,ApproximateLastSignInDateTime,RegistrationDateTime | Format-Table
                 Write-Host "There are $($DisabledDevices.Count) disabled $DeviceJoinType devices in the $((Get-MgOrganization).DisplayName) Entra tenant" -ForegroundColor Yellow
 }
 #Endregion Disable devices
