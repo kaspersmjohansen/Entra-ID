@@ -48,7 +48,7 @@ Removes stale device from Entra - Run this at your own risk!
         CSV file export feature
 
 .VERSION
-    0.9
+    0.9.3
 
 .AUTHOR
     Kasper Johansen 
@@ -58,13 +58,17 @@ Removes stale device from Entra - Run this at your own risk!
     Apento
 
 .COPYRIGHT
-    Feel free to use this
+    Feel free to use this as much as you want :)
 
 .RELEASENOTES
-    25-04-2024 - 0.9 - Latest BETA version
+    25-04-2024 - 0.9 - Script is in BETA, still testing stuff
+    26-04-2024 - 0.9.2 - Parts of the script has been rewritten, see change log for additional information
+    27-04-2024 - 0.9.3 - It's now possible to export af list of stale devices to a CSV file
 
 .CHANGELOG
     0.9 - Latest BETA version
+    0.9.2 - Get-StaleDevices function rewritten to use filtering instead of where-object, this change has made the script almost 50% faster
+    0.9.3 - Added CSV export feature
 #>
 
 param(
@@ -74,6 +78,8 @@ param(
     [string]$DeviceJoinType = "AzureAD",   
     [Parameter(Mandatory = $true)]
     [string]$TenantID,
+    [Parameter(Mandatory = $False)]
+    [switch]$ExportToCSV,
     [switch]$ListDevice,
     [switch]$DisableDevice,
     [switch]$RemoveDevice
@@ -82,10 +88,20 @@ param(
 function Get-StaleDevices
 {
     param(
-            $Age,
-            $JoinType
+            [string]$Age,
+            [string]$JoinType,
+            [switch]$DisabledDevices
     )
-    Get-MgDevice -All | Where-Object {$_.ApproximateLastSignInDateTime -le $((Get-Date).AddDays(-$Age)) -and $_.OperatingSystem -eq "Windows" -and $_.TrustType -eq $JoinType}   
+    # Convert date/time to ISO8601 format
+    #[string]$Days = Get-Date (Get-Date).AddDays(-$Age) -UFormat '+%Y-%m-%dT%H:%M:%SZ'
+
+    If ($DisabledDevices)
+    {
+        Get-MgDevice -All -Filter "OperatingSystem eq 'Windows' AND TrustType eq '$JoinType' AND AccountEnabled eq false"    
+    }
+    else{
+        Get-MgDevice -All -Filter "ApproximateLastSignInDateTime le $((Get-Date).AddDays(-$Age).ToString("s"))Z AND OperatingSystem eq 'Windows' AND TrustType eq '$JoinType'"
+    }
 }
 
 #Region Install and import Powershell module
@@ -104,13 +120,23 @@ Connect-MgGraph -Scopes $RequiredScopes -TenantId $TenantID -NoWelcome
 #Region Get devices
 # Get all devices
 Write-Host "Enumerating stale devices" -ForegroundColor Cyan
-Write-Host ""
 $StaleDevices = Get-StaleDevices -Age $DeviceAge -JoinType $DeviceJoinType
 
+# Create a table view of the stale devices
 If ($ListDevice)
 {
+    Write-Host "Creating a table view list of stale $DeviceJoin devices" -ForegroundColor Cyan
     $StaleDevices | select-object DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,ApproximateLastSignInDateTime,RegistrationDateTime | Format-Table
 }
+
+# Export the list of stale device to af CSV file
+If ($ExportToCSV)
+{
+    Write-Host "Exporting list of stale $DeviceJoinType devices to a CSV file" -ForegroundColor Cyan
+    $CSVfile = $("Stale" + "-" + $DeviceJoinType + "-" +"devices" + "-" + $(Get-Date -Format HHmmssyyyy)) + ".csv"
+    $StaleDevices | select-object DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,ApproximateLastSignInDateTime,RegistrationDateTime | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+}
+# Output the amount of stale devices
 Write-Host "There are $($StaleDevices.Count) stale $DeviceJoinType devices in the $((Get-MgOrganization).DisplayName) Entra tenant which are older than $DeviceAge days" -ForegroundColor Yellow
 #Endregion Get devices
 
@@ -125,8 +151,9 @@ If ($DisableDevice)
             Write-Host "Disable device - $($Device.Displayname)"
             Update-MgDevice -DeviceId $($Device.Id) -BodyParameter $params -WhatIf
         }
-                $DisabledDevices = Get-MgDevice -All | Where-Object {$_.OperatingSystem -eq "Windows" -and $_.TrustType -eq $DeviceJoinType -and $_.AccountEnabled -eq "false"}
-                $DisabledDevices | select-object DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,ApproximateLastSignInDateTime,RegistrationDateTime | Format-Table
+                #$DisabledDevices = Get-MgDevice -All | Where-Object {$_.OperatingSystem -eq "Windows" -and $_.TrustType -eq $DeviceJoinType -and $_.AccountEnabled -eq "false"}
+                $DisabledDevices = Get-StaleDevices -JoinType $DeviceJoinType -DisabledDevices
+                #$DisabledDevices | select-object DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,ApproximateLastSignInDateTime,RegistrationDateTime | Format-Table
                 Write-Host "There are $($DisabledDevices.Count) disabled $DeviceJoinType devices in the $((Get-MgOrganization).DisplayName) Entra tenant" -ForegroundColor Yellow
 }
 #Endregion Disable devices
