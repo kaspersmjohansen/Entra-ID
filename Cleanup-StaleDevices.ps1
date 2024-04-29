@@ -8,24 +8,31 @@
     you are are also able to both disable and delete stale devices.
 
 .PARAMETER DeviceAge
-Device object age. 1 is the lowest supported age value of a device object and 5475 (15 years) is the max supported age value.
-If not configured, the default value is 180 days, counting from the day the script is executed.
+    Device object age. 1 is the lowest supported age value of a device object and 5475 (15 years) is the max supported age value.
+    If not configured, the default value is 180 days, counting from the day the script is executed.
 
 .PARAMETER DeviceJoinType
-Device trust type. Supported values are - Workplace = Entra registered, AzureAD = Entra joined, ServerAD = hybrid joined
-If not configured, the default value is AzureAD
+    Device trust type. Supported values are - Workplace = Entra registered, AzureAD = Entra joined, ServerAD = hybrid joined
+    If not configured, the default value is AzureAD
+
+.PARAMETER OperatingSystem
+    Specifies the Operating System of the device. Supported Operating Systems are, Android, iPad, iPhone, iOS, Windows and Unknown.
+    If not configured, the default values is Windows. Multiple operating system values are not supported.
 
 .PARAMETER TenantID
-Tenant ID you want to connect to.
+    Tenant ID you want to connect to.
+
+.PARAMETER ExportToCSV
+    Exports a list of devices to a CSV file. The CSV file is exported to the same folder as this script.
 
 .PARAMETER ListDevice
-List stale devices in a table format
+    List stale devices in a table format
 
 .PARAMETER DisableDevice
-Disables stale devices
+    Disables stale devices
 
 .PARAMETER RemoveDevice
-Removes stale device from Entra - Run this at your own risk!
+    Removes stale device from Entra - Run this at your own risk!
         
 .EXAMPLE
     .\Cleanup-StaleDevices.ps1 -DeviceAge 90 -DeviceJoinType Workplace -TenantID yourdomain.onmicrosoft.com
@@ -40,15 +47,17 @@ Removes stale device from Entra - Run this at your own risk!
     .\Cleanup-StaleDevices.ps1 -DeviceAge 60 -DeviceJoinType ServerAD -TenantID yourdomain.onmicrosoft.com -RemoveDevices
         Removes all stale Entra hybrid joined devices that hasn't registered with Entra within 60 days.
 
+    .\Cleanup-StaleDevices.ps1 -DeviceAge 180 -DeviceJoinType Workplace -TenantID yourdomain.onmicrosoft.com -ExporttoCSV
+
+    .\Cleanup-StaleDevices.ps1 -DeviceAge 180 -DeviceJoinType Workplace -OperatingSystem Android -TenantID yourdomain.onmicrosoft.com
+
 .NOTES
     To-do list/future features:
         Remove "whatif" in Disable devices and Remove devices regions
         Error handling
-        Extend OS Support to Android, iOS and MacOS
-        CSV file export feature
-
+        
 .VERSION
-    0.9.4
+    0.9.5
 
 .AUTHOR
     Kasper Johansen 
@@ -65,19 +74,23 @@ Removes stale device from Entra - Run this at your own risk!
     26-04-2024 - 0.9.2 - Parts of the script has been rewritten, see change log for additional information
     27-04-2024 - 0.9.3 - It's now possible to export af list of stale devices to a CSV file
     27-04-2024 - 0.9.4 - Code cleanup
+    28-04-2024 - 0.9.5 - Added support for additional operating systems
 
 .CHANGELOG
     0.9.0 - Latest BETA version
     0.9.2 - Get-StaleDevices function rewritten to use filtering instead of where-object, this change has made the script almost 50% faster
     0.9.3 - Added CSV export feature
     0.9.4 - Code cleanup. Removed unused parts of the code
+    0.9.5 - The OperatingSystem property now supports Android, iPad, iPhone, iOS and Unknown operating systems 
 #>
 
 param(
     [Parameter(Mandatory = $false)][ValidateRange(1,5475)]
     [Int32]$DeviceAge = "180",
     [Parameter(Mandatory = $false)][ValidateSet("AzureAD","ServerAD","Workplace")]
-    [string]$DeviceJoinType = "AzureAD",   
+    [string]$DeviceJoinType = "AzureAD",
+    [Parameter(Mandatory = $false)][ValidateSet("Android","iOS","Ipad","Iphone","Windows","Unknown")]
+    [string]$OperatingSystem = "Windows",   
     [Parameter(Mandatory = $true)]
     [string]$TenantID,
     [Parameter(Mandatory = $False)]
@@ -92,14 +105,15 @@ function Get-StaleDevices
     param(
             [string]$Age,
             [string]$JoinType,
+            [string]$OS,
             [switch]$DisabledDevices
     )
     If ($DisabledDevices)
     {
-        Get-MgDevice -All -Filter "OperatingSystem eq 'Windows' AND TrustType eq '$JoinType' AND AccountEnabled eq false"    
+        Get-MgDevice -All -Filter "OperatingSystem eq '$OS' AND TrustType eq '$JoinType' AND AccountEnabled eq false"    
     }
     else{
-        Get-MgDevice -All -Filter "ApproximateLastSignInDateTime le $((Get-Date).AddDays(-$Age).ToString("s"))Z AND OperatingSystem eq 'Windows' AND TrustType eq '$JoinType'"
+        Get-MgDevice -All -Filter "ApproximateLastSignInDateTime le $((Get-Date).AddDays(-$Age).ToString("s"))Z AND OperatingSystem eq '$OS' AND TrustType eq '$JoinType'"
     }
 }
 
@@ -119,25 +133,25 @@ Connect-MgGraph -Scopes $RequiredScopes -TenantId $TenantID -NoWelcome
 
 #Region Get devices
 # Get stale devices
-Write-Host "Enumerating stale devices" -ForegroundColor Cyan
-$StaleDevices = Get-StaleDevices -Age $DeviceAge -JoinType $DeviceJoinType
+Write-Host "Enumerating stale $OperatingSytem devices" -ForegroundColor Cyan
+$StaleDevices = Get-StaleDevices -Age $DeviceAge -JoinType $DeviceJoinType -OS $OperatingSystem
 
 # Create a table view of the stale devices
 If ($ListDevice)
 {
-    Write-Host "Creating a table view list of stale $DeviceJoin devices" -ForegroundColor Cyan
+    Write-Host "Creating a table view list of stale $DeviceJoin $OperatingSytem devices" -ForegroundColor Cyan
     $StaleDevices | select-object DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,ApproximateLastSignInDateTime,RegistrationDateTime | Format-Table
 }
 
 # Export the list of stale device to af CSV file
 If ($ExportToCSV)
 {
-    Write-Host "Exporting list of stale $DeviceJoinType devices to a CSV file" -ForegroundColor Cyan
-    $CSVfile = $("Stale" + "-" + $DeviceJoinType + "-" +"devices" + "-" + $(Get-Date -Format HHmmssyyyy)) + ".csv"
+    Write-Host "Exporting list of stale $DeviceJoinType $OperatingSytem devices to a CSV file" -ForegroundColor Cyan
+    $CSVfile = $("Stale" + "-" + $DeviceJoinType + "-" + $OperatingSytem + "-" + "devices" + "-" + $(Get-Date -Format HHmmssyyyy)) + ".csv"
     $StaleDevices | select-object DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,ApproximateLastSignInDateTime,RegistrationDateTime | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
 }
 # Output the amount of stale devices
-Write-Host "There are $($StaleDevices.Count) stale $DeviceJoinType devices in the $((Get-MgOrganization).DisplayName) Entra tenant which are older than $DeviceAge days" -ForegroundColor Yellow
+Write-Host "There are $($StaleDevices.Count) stale $DeviceJoinType $OperatingSytem devices in the $((Get-MgOrganization).DisplayName) Entra tenant which are older than $DeviceAge days" -ForegroundColor Yellow
 #Endregion Get devices
 
 #Region Disable devices
@@ -148,11 +162,11 @@ If ($DisableDevice)
     }
         ForEach ($Device in $StaleDevices)
         {
-            Write-Host "Disable device - $($Device.Displayname)"
+            Write-Host "Disable stale $OperatingSytem device - $($Device.Displayname)"
             Update-MgDevice -DeviceId $($Device.Id) -BodyParameter $params -WhatIf
         }
                 $DisabledDevices = Get-StaleDevices -JoinType $DeviceJoinType -DisabledDevices
-                Write-Host "There are $($DisabledDevices.Count) disabled $DeviceJoinType devices in the $((Get-MgOrganization).DisplayName) Entra tenant" -ForegroundColor Yellow
+                Write-Host "There are $($DisabledDevices.Count) disabled $DeviceJoinType $OperatingSytem devices in the $((Get-MgOrganization).DisplayName) Entra tenant" -ForegroundColor Yellow
 }
 #Endregion Disable devices
 
@@ -161,6 +175,7 @@ If ($DeleteDevice)
 {
     ForEach ($Device in $StaleDevices)
     {
+        Write-Host "Removing stale $OperatingSytem device - $($Device.Displayname)"
         Remove-MgDevice -DeviceId $Device.Id -WhatIf
     }
 }
