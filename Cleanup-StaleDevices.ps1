@@ -72,7 +72,7 @@
 .RELEASENOTES
     25-04-2024 - 0.9 - Script is in BETA, still testing stuff
     26-04-2024 - 0.9.2 - Parts of the script has been rewritten, see change log for additional information
-    27-04-2024 - 0.9.3 - It's now possible to export af list of stale devices to a CSV file
+    27-04-2024 - 0.9.3 - It's now possible to export a list of stale devices to a CSV file
     27-04-2024 - 0.9.4 - Code cleanup
     28-04-2024 - 0.9.5 - Added support for additional operating systems
 
