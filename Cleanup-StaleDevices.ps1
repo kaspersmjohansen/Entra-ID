@@ -93,7 +93,6 @@ param(
     [string]$OperatingSystem = "Windows",   
     [Parameter(Mandatory = $true)]
     [string]$TenantID,
-    [Parameter(Mandatory = $False)]
     [switch]$ExportToCSV,
     [switch]$ListDevice,
     [switch]$DisableDevice,
