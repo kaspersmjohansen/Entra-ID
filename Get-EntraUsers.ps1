@@ -4,8 +4,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TenantID,
     [switch]$ExportToCSV,
+    [switch]$ListUser,
     [switch]$DisabledUsers
      )
+
 
 #Region Install and import Powershell module
 # Download and install require Powershell modules
@@ -16,8 +18,7 @@ Install-Module -Name Microsoft.Graph.Users -Scope CurrentUser | Out-Null
 Import-Module -Name Microsoft.Graph.Users
 #Endregion Install and import Powershell module
 
-
-
+<#
 function Get-Users
 {
     param(
@@ -32,6 +33,7 @@ function Get-Users
         Get-MgDevice -All -Filter "ApproximateLastSignInDateTime le $((Get-Date).AddDays(-$Age).ToString("s"))Z AND OperatingSystem eq '$OS' AND TrustType eq '$JoinType'"
     }
 }
+#>
 
 # Connect to Microsoft Graph API
 Write-Host "Connecting to the Microsoft Graph API" -ForegroundColor Cyan
@@ -39,21 +41,92 @@ $RequiredScopes = "User.ReadBasic.All","User.Read.All","AuditLog.Read.All"
 $TenantID = "virtualwarlock.net"
 Connect-MgGraph -Scopes $RequiredScopes -TenantId $TenantID -NoWelcome
 
-If ($UserType -eq "Cloud")
+If ($UserType -eq "Cloud" -and -not $DisabledUsers)
 {
-    Get-MgUser -All -Filter "OnPremisesSyncEnabled ne true and UserType eq 'Member'" -ConsistencyLevel eventual -CountVariable CountVar
+    $Users = Get-MgUser -All -Property DisplayName,UserPrincipalName,SignInActivity -Filter "OnPremisesSyncEnabled ne true and UserType eq 'Member'" -ConsistencyLevel eventual -CountVariable CountVar
+    $Users.Count
+
+    If ($ListUser)
+    {
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}} | Format-Table
+    }
+
+    If ($ExporttoCSV)
+    {
+        #Write-Host "Exporting list of stale $DeviceJoinType $OperatingSytem devices to a CSV file" -ForegroundColor Cyan
+        $CSVfile = $($UserType + "-" + "Users" + "-" +$(Get-Date -Format HHmmssyyyy)) + ".csv"
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+    }
 }
-# All cloud users including guest users
-Get-MgUser -All -Filter "OnPremisesSyncEnabled ne true" -ConsistencyLevel eventual -CountVariable CountVar
 
-# All synced users
-Get-MgUser -All -Filter "OnPremisesSyncEnabled eq true"
+If ($UserType -eq "OnPremSynced" -and -not $DisabledUsers)
+{
+    $Users = Get-MgUser -All -Property DisplayName,UserPrincipalName,SignInActivity -Filter "OnPremisesSyncEnabled eq true" -ConsistencyLevel eventual -CountVariable CountVar
+    $Users.Count
 
-# All cloud users excluding guest users
-Get-MgUser -All -Filter "OnPremisesSyncEnabled ne true and UserType eq 'Member'" -ConsistencyLevel eventual -CountVariable CountVar
+    If ($ListUser)
+    {
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}} | Format-Table
+    }
 
-# All guest users
-Get-MgUser -All -Filter "UserType ne 'Member'" -ConsistencyLevel eventual -CountVariable CountVar
+    If ($ExporttoCSV)
+    {
+        #Write-Host "Exporting list of stale $DeviceJoinType $OperatingSytem devices to a CSV file" -ForegroundColor Cyan
+        $CSVfile = $($UserType + "-" + "Users" + "-" +$(Get-Date -Format HHmmssyyyy)) + ".csv"
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+    }
+}
 
-# Sign in activity
-Get-MgUser -UserId "944d57a0-0d24-4d55-ac5b-e9b741be9031" -Property SignInActivity | Select-Object -ExpandProperty SignInActivity
+If ($UserType -eq "Guest" -and -not $DisabledUsers)
+{
+    $Users = Get-MgUser -All -Property DisplayName,UserPrincipalName,SignInActivity -Filter "UserType ne 'Member'" -ConsistencyLevel eventual -CountVariable CountVar
+    $Users.Count
+
+    If ($ListUser)
+    {
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}} | Format-Table
+    }
+
+    If ($ExporttoCSV)
+    {
+        #Write-Host "Exporting list of stale $DeviceJoinType $OperatingSytem devices to a CSV file" -ForegroundColor Cyan
+        $CSVfile = $($UserType + "-" + "Users" + "-" +$(Get-Date -Format HHmmssyyyy)) + ".csv"
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+    }
+}
+
+If ($UserType -eq "All" -and -not $DisabledUsers)
+{
+    $Users = Get-MgUser -All -Property DisplayName,UserPrincipalName,SignInActivity
+    $Users.Count
+
+    If ($ListUser)
+    {
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}} | Format-Table
+    }
+
+    If ($ExporttoCSV)
+    {
+        #Write-Host "Exporting list of stale $DeviceJoinType $OperatingSytem devices to a CSV file" -ForegroundColor Cyan
+        $CSVfile = $($UserType + "-" + "Users" + "-" +$(Get-Date -Format HHmmssyyyy)) + ".csv"
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+    }
+}
+
+If ($DisabledUsers)
+{
+    $Users = Get-MgUser -All -Filter "accountEnabled ne true" -Property DisplayName,UserPrincipalName,SignInActivity -ConsistencyLevel eventual -CountVariable CountVar
+    $Users.Count
+
+    If ($ListUser)
+    {
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}} | Format-Table
+    }
+
+    If ($ExporttoCSV)
+    {
+        #Write-Host "Exporting list of stale $DeviceJoinType $OperatingSytem devices to a CSV file" -ForegroundColor Cyan
+        $CSVfile = $($UserType + "-" + "Users" + "-" +$(Get-Date -Format HHmmssyyyy)) + ".csv"
+        $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+    }     
+}
