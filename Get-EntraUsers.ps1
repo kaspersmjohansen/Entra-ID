@@ -130,7 +130,8 @@ If ($UserType -eq "All" -and -not $DisabledUsers)
 
 If ($DisabledUsers)
 {
-    $Users = Get-MgUser -All -Filter "accountEnabled ne true" -Property DisplayName,UserPrincipalName,SignInActivity,accountEnabled,UsageLocation -ConsistencyLevel eventual -CountVariable CountVar
+    $Users = Get-User -Filter "UserType ne 'Member'"
+    #$Users = Get-MgUser -All -Filter "accountEnabled ne true" -Property DisplayName,UserPrincipalName,SignInActivity,accountEnabled,UsageLocation -ConsistencyLevel eventual -CountVariable CountVar
     
     If ($ListUser)
     {
