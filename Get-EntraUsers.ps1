@@ -34,7 +34,7 @@ Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
 Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
 Install-Module -Name Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser | Out-Null
 Install-Module -Name Microsoft.Graph.Users -Scope CurrentUser | Out-Null
-Install-Module -Name Microsoft.Graph.Identity.DirectoryManagement 
+Import-Module -Name Microsoft.Graph.Identity.DirectoryManagement 
 Import-Module -Name Microsoft.Graph.Users
 #Endregion Install and import Powershell module
 
