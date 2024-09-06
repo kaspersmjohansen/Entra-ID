@@ -32,8 +32,8 @@ function Get-User
 Write-Host "Downloading and installing Powershell modules" -ForegroundColor Cyan
 Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
 Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-Install-Module -Name Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser | Out-Null
-Install-Module -Name Microsoft.Graph.Users -Scope CurrentUser | Out-Null
+Install-Module -Name Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser -Force | Out-Null
+Install-Module -Name Microsoft.Graph.Users -Scope CurrentUser -Force | Out-Null
 Import-Module -Name Microsoft.Graph.Identity.DirectoryManagement 
 Import-Module -Name Microsoft.Graph.Users
 #Endregion Install and import Powershell module
@@ -41,7 +41,6 @@ Import-Module -Name Microsoft.Graph.Users
 # Connect to Microsoft Graph API
 Write-Host "Connecting to the Microsoft Graph API" -ForegroundColor Cyan
 $RequiredScopes = "User.ReadBasic.All","User.Read.All","AuditLog.Read.All"
-$TenantID = "virtualwarlock.net"
 Connect-MgGraph -Scopes $RequiredScopes -TenantId $TenantID -NoWelcome
 
 # Get all enabled cloud users
