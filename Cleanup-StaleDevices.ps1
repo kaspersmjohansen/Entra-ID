@@ -132,25 +132,25 @@ Connect-MgGraph -Scopes $RequiredScopes -TenantId $TenantID -NoWelcome
 
 #Region Get devices
 # Get stale devices
-Write-Host "Enumerating stale $OperatingSytem devices" -ForegroundColor Cyan
+Write-Host "Enumerating stale $OperatingSystem devices" -ForegroundColor Cyan
 $StaleDevices = Get-StaleDevices -Age $DeviceAge -JoinType $DeviceJoinType -OS $OperatingSystem
 
 # Create a table view of the stale devices
 If ($ListDevice)
 {
-    Write-Host "Creating a table view list of stale $DeviceJoin $OperatingSytem devices" -ForegroundColor Cyan
+    Write-Host "Creating a table view list of stale $DeviceJoin $OperatingSystem devices" -ForegroundColor Cyan
     $StaleDevices | select-object DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,ApproximateLastSignInDateTime,RegistrationDateTime | Format-Table
 }
 
 # Export the list of stale device to af CSV file
 If ($ExportToCSV)
 {
-    Write-Host "Exporting list of stale $DeviceJoinType $OperatingSytem devices to a CSV file" -ForegroundColor Cyan
-    $CSVfile = $("Stale" + "-" + $DeviceJoinType + "-" + $OperatingSytem + "-" + "devices" + "-" + $(Get-Date -Format HHmmssyyyy)) + ".csv"
+    Write-Host "Exporting list of stale $DeviceJoinType $OperatingSystem devices to a CSV file" -ForegroundColor Cyan
+    $CSVfile = $("Stale" + "-" + $DeviceJoinType + "-" + $OperatingSystem + "-" + "devices" + "-" + $(Get-Date -Format HHmmssyyyy)) + ".csv"
     $StaleDevices | select-object DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,ApproximateLastSignInDateTime,RegistrationDateTime | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
 }
 # Output the amount of stale devices
-Write-Host "There are $($StaleDevices.Count) stale $DeviceJoinType $OperatingSytem devices in the $((Get-MgOrganization).DisplayName) Entra tenant which are older than $DeviceAge days" -ForegroundColor Yellow
+Write-Host "There are $($StaleDevices.Count) stale $DeviceJoinType $OperatingSystem devices in the $((Get-MgOrganization).DisplayName) Entra tenant which are older than $DeviceAge days" -ForegroundColor Yellow
 #Endregion Get devices
 
 #Region Disable devices
@@ -165,7 +165,7 @@ If ($DisableDevice)
             Update-MgDevice -DeviceId $($Device.Id) -BodyParameter $params -WhatIf
         }
                 $DisabledDevices = Get-StaleDevices -JoinType $DeviceJoinType -DisabledDevices
-                Write-Host "There are $($DisabledDevices.Count) disabled $DeviceJoinType $OperatingSytem devices in the $((Get-MgOrganization).DisplayName) Entra tenant" -ForegroundColor Yellow
+                Write-Host "There are $($DisabledDevices.Count) disabled $DeviceJoinType $OperatingSystem devices in the $((Get-MgOrganization).DisplayName) Entra tenant" -ForegroundColor Yellow
 }
 #Endregion Disable devices
 
