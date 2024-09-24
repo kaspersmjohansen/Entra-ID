@@ -1,3 +1,55 @@
+<#PSScriptInfo
+.SYNOPSIS
+    Script to cleanup stale Entra ID device object
+ 
+.DESCRIPTION
+    This script with get and/or list all stale Entra ID objects using the Microsoft Graph API. 
+    Based on the parameters provided, you get get a table view of the stale devices and
+    you are are also able to both disable and delete stale devices.
+
+.PARAMETER UserType
+    Device object age. 1 is the lowest supported age value of a device object and 5475 (15 years) is the max supported age value.
+    If not configured, the default value is 180 days, counting from the day the script is executed.
+
+.PARAMETER TenantID
+    Tenant ID you want to connect to.
+
+.PARAMETER UserAge
+
+.PARAMETER ExportToCSV
+    Exports a list of devices to a CSV file. The CSV file is exported to the same folder as this script.
+
+.PARAMETER ListUsers
+    List stale devices in a table format
+
+.PARAMETER DisabledUsers
+    Disables stale devices
+        
+.EXAMPLE
+    
+
+.NOTES
+    
+        
+.VERSION
+    0.9.0
+
+.AUTHOR
+    Kasper Johansen 
+    kmj@apento.com
+
+.COMPANYNAME 
+    Apento
+
+.COPYRIGHT
+    Feel free to use this as much as you want :)
+
+.RELEASENOTES
+    
+
+.CHANGELOG
+    0.9.0 - Latest BETA version
+#>
 param(
     [Parameter(Mandatory = $true)][ValidateSet("Entra","Hybrid","Guest","All")]
     [string]$UserType,
@@ -5,13 +57,10 @@ param(
     [string]$TenantID,
     [Parameter(Mandatory = $false)][ValidateRange(1,5475)]
     [Int32]$UserAge,
-    #[Parameter(Mandatory = $false)][ValidateSet("True","False","Only")]
-    #[string]$DisabledUsers = "false",
     [switch]$ExportToCSV,
     [switch]$ListUser,
-    #[switch]$StaleUser,
     [switch]$DisabledUsers
-     )
+    )
 
 function Get-User
 {
@@ -35,7 +84,7 @@ function Get-User
                         Get-MgUser -All -Property DisplayName,UserPrincipalName,SignInActivity,accountEnabled,UsageLocation,UserType -Filter $($Filter+" "+"and"+" "+"accountEnabled eq false") -ConsistencyLevel eventual -CountVariable CountVar
                     }
             }
-                else 
+                else
                 {
                     If ($List)
                     {
@@ -65,11 +114,20 @@ function Get-UserList
 <#
 function Get-UserCSV
 {
+    [CmdletBinding()]
+    Param(
+        #[Parameter(ValueFromPipeline)]        
+        $Usrs
+    )
+    
+    $CSVfile = $("Entra" + "-" + "Users" + "-" +$(Get-Date -Format HHmmss-MMddyyyy)) + ".csv"
     Write-Host "Exporting list of users to $PSScriptRoot\$CSVfile" -ForegroundColor Cyan
-    $CSVfile = $($UserType + "-" + "Users" + "-" +$(Get-Date -Format HHmmss-MMddyyyy)) + ".csv"
-    Get-UserList | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+    $Usrs | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}},@{Name='AccountEnabled';Expression={$_.AccountEnabled}},@{Name='UsageLocation';Expression={$_.UsageLocation}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+
+    #Get-User -Filter | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
 }
 #>
+
 
 #Region Install and import Powershell module
 # Install NuGet pacakage provider
@@ -140,6 +198,7 @@ Write-Host "Connecting to the Microsoft Graph API" -ForegroundColor Cyan
 $RequiredScopes = "User.ReadBasic.All","User.Read.All","AuditLog.Read.All"
 Connect-MgGraph -Scopes $RequiredScopes -TenantId $TenantID -NoWelcome
 
+<#
 # Set user type
 $User = Switch ($UserType) 
 {  
@@ -148,30 +207,30 @@ $User = Switch ($UserType)
     #"Guest" {"Guest"}
     #"All" {"All"}
 }
+#>
 
 # Get all enabled cloud users
-If ($UserType -eq "Entra") #-and -not $DisabledUsers -and -not $UserAge)
+If ($UserType -eq "Entra")
 {
+    $Fltr = "UserType eq 'Member'"
     If ($DisabledUsers -and (!($ListUser)))
     {
-        $Users = Get-User -Filter "UserType eq '$User'" -Disabled:$true -List:$false
+        $Users = Get-User -Filter "$Fltr" -Disabled:$true -List:$false
         If ($Users.Count -gt "1")
         {
-            Write-Host "There are $($Users.Count) disabled $UserType-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
+            Write-Host "There are $($Users.Count) disabled Entra-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
         }
             else
             {
-                Write-Host "There is $($Users.Count) disabled $UserType-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
+                Write-Host "There is $($Users.Count) disabled Entra-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
             }
     }
         elseif ($DisabledUsers -and $ListUser)
         {
-            Write-host "Listing disabled users"
-            Get-User -Filter "UserType eq '$User'" -Disabled:$true -List:$true
+            Get-User -Filter "$Fltr" -Disabled:$true -List:$true
         }
             elseif ($ListUser -and (!($DisabledUsers)))
             {
-                Write-Host "Listing non-disabled users"
                 Get-User -Filter "UserType eq '$User'" -List:$true -Disabled:$false
             }
                 else
@@ -179,14 +238,87 @@ If ($UserType -eq "Entra") #-and -not $DisabledUsers -and -not $UserAge)
                     $Users = Get-User -Filter "UserType eq '$User'"
                     If ($Users.Count -gt "1")
                     {
-                        Write-Host "There are $($Users.Count) $UserType-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
+                        Write-Host "There are $($Users.Count) Entra-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
                     }
                         else
                         {
-                            Write-Host "There is $($Users.Count) $UserType-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
+                            Write-Host "There is $($Users.Count) Entra-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
                         }
                 }
-    
+
+    If ($ExportToCSV)
+    {
+        If ($DisabledUsers)
+        { 
+            $Users = Get-User -Filter "$Fltr" -Disabled:$true -List:$false
+            $CSVfile = $("Disabled"+"-"+$UserType+"-"+"Users"+"-"+$(Get-Date -Format HHmmss-MMddyyyy))+".csv"
+            Write-Host "Exporting list of disabled Entra-only users to $PSScriptRoot\$CSVfile" -ForegroundColor Cyan
+            $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}},@{Name='AccountEnabled';Expression={$_.AccountEnabled}},@{Name='UsageLocation';Expression={$_.UsageLocation}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+        }
+            else
+            {
+                $Users = Get-User -Filter "$Fltr" -Disabled:$false -List:$false
+                $CSVfile = $($UserType+"-"+"Users"+"-"+$(Get-Date -Format HHmmss-MMddyyyy))+".csv"
+                Write-Host "Exporting list of Entra-only users to $PSScriptRoot\$CSVfile" -ForegroundColor Cyan
+                $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}},@{Name='AccountEnabled';Expression={$_.AccountEnabled}},@{Name='UsageLocation';Expression={$_.UsageLocation}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+            }
+    }
+}
+
+If ($UserType -eq "Hybrid")
+{
+    $Fltr = "OnPremisesSyncEnabled eq true"
+    If ($DisabledUsers -and (!($ListUser)))
+    {
+        $Users = Get-User -Filter "$Fltr" -Disabled:$true -List:$false
+        If ($Users.Count -gt "1")
+        {
+            Write-Host "There are $($Users.Count) disabled Entra-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
+        }
+            else
+            {
+                Write-Host "There is $($Users.Count) disabled Entra-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
+            }
+    }
+        elseif ($DisabledUsers -and $ListUser)
+        {
+            Get-User -Filter "OnPremisesSyncEnabled eq true" -Disabled:$true -List:$true
+        }
+            elseif ($ListUser -and (!($DisabledUsers)))
+            {
+                Get-User -Filter "OnPremisesSyncEnabled eq true" -List:$true -Disabled:$false
+            }
+                else
+                {
+                    $Users = Get-User -Filter "$Fltr"
+                    If ($Users.Count -gt "1")
+                    {
+                        Write-Host "There are $($Users.Count) Entra-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
+                    }
+                        else
+                        {
+                            Write-Host "There is $($Users.Count) Entra-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
+                        }
+                }
+
+    If ($ExportToCSV)
+    {
+        If ($DisabledUsers)
+        { 
+            $Users = Get-User -Filter "$Fltr" -Disabled:$true -List:$false
+            $CSVfile = $("Disabled"+"-"+$UserType+"-"+"Users"+"-"+$(Get-Date -Format HHmmss-MMddyyyy))+".csv"
+            Write-Host "Exporting list of disabled Entra hybrid users to $PSScriptRoot\$CSVfile" -ForegroundColor Cyan
+            $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}},@{Name='AccountEnabled';Expression={$_.AccountEnabled}},@{Name='UsageLocation';Expression={$_.UsageLocation}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+        }
+            else
+            {
+                $Users = Get-User -Filter "$Fltr" -Disabled:$false -List:$false
+                $CSVfile = $($UserType+"-"+"Users"+"-"+$(Get-Date -Format HHmmss-MMddyyyy))+".csv"
+                Write-Host "Exporting list of Entra-only users to $PSScriptRoot\$CSVfile" -ForegroundColor Cyan
+                $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}},@{Name='AccountEnabled';Expression={$_.AccountEnabled}},@{Name='UsageLocation';Expression={$_.UsageLocation}} | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
+            }
+    }
+}
     # Get-MgUser -All -Property DisplayName,UserPrincipalName,SignInActivity,accountEnabled,UsageLocation -Filter "OnPremisesSyncEnabled ne true and UserType eq 'Member'" -ConsistencyLevel eventual -CountVariable CountVar
     
     
@@ -205,7 +337,7 @@ If ($UserType -eq "Entra") #-and -not $DisabledUsers -and -not $UserAge)
         #$Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}},@{Name='AccountEnabled';Expression={$_.AccountEnabled}},@{Name='UsageLocation';Expression={$_.UsageLocation}},UserType | Format-Table
         #>
     #}
-    
+    <#
     If ($ListUser -and -not $DisabledUsers)
     {
         Get-User -Filter "UserType eq '$User'" -List
@@ -221,7 +353,7 @@ If ($UserType -eq "Entra") #-and -not $DisabledUsers -and -not $UserAge)
                 $Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}},@{Name='AccountEnabled';Expression={$_.AccountEnabled}},@{Name='UsageLocation';Expression={$_.UsageLocation}},UserType | Format-Table
                 Write-Host "There is $($Users.Count) disabled $UserType-only users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
             }
-        #>    
+            
     #}
 
     If ($ExporttoCSV)
@@ -231,7 +363,8 @@ If ($UserType -eq "Entra") #-and -not $DisabledUsers -and -not $UserAge)
         #$Users | Select-Object Displayname,UserPrincipalName,@{Name='LastNonInteractiveSignInDateTime';Expression={$_.SignInActivity.LastNonInteractiveSignInDateTime}},@{Name='LastSignInDateTime';Expression={$_.SignInActivity.LastSignInDateTime}},@{Name='AccountEnabled';Expression={$_.AccountEnabled}},@{Name='UsageLocation';Expression={$_.UsageLocation}},UserType | Export-Csv -Path $PSScriptRoot\$CSVfile -NoClobber -NoTypeInformation -Delimiter ";" -Encoding utf8 -Append
         Get-UserCSV
     }
-}
+    #>
+
 <#
 # Get all enabled on-prem synced users 
 If ($UserType -eq "Hybrid" -and -not $DisabledUsers -and -not $UserAge)
@@ -316,9 +449,9 @@ If ($DisabledUsers)
     Write-Host "There are $($Users.Count) disabled users in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
 }
     #>
-
-If ($UserAge)
-{
+<#
+#f ($UserAge)
+#{
     $UserAge
     $Users = Get-User | Where-Object {($_.SignInActivity.LastSignInDateTime -le $((Get-Date).AddDays(-$UserAge)))}
    
@@ -337,7 +470,8 @@ If ($UserAge)
     
     Write-Host "There are $($Users.Count) users that have never signed in or have not signed in within the last $UserAge days in the $((Get-MgOrganization).DisplayName) Entra ID tenant" -ForegroundColor Yellow
     
-}
+#}
+#>
 
 #$Inactiveusers= get-MgUser -Property DisplayName, UserPrincipalName, SignInActivity, UserType
 #$Inactiveusers | Where-Object {($_.SignInActivity.LastSignInDateTime -le $((Get-Date).AddDays(-30))) -and ($_.UserType -eq "Member")}
