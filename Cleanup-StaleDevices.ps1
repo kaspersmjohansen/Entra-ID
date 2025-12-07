@@ -119,10 +119,28 @@ function Get-StaleDevices
 #Region Install and import Powershell module
 # Download and install require Powershell modules
 Write-Host "Downloading and installing Powershell modules" -ForegroundColor Cyan
-Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
+If (!(Get-PackageProvider | Where {$_.Name -eq "NuGet"} -ErrorAction SilentlyContinue))
+{
+    Write-Host "Nuget is not installed" -ForegroundColor Cyan
+    Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null    
+}
+else
+{
+    Write-Host "Nuget package provider is already installed" -ForegroundColor Cyan        
+}
+
 Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-Install-Module -Name Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser | Out-Null
-Import-Module -Name Microsoft.Graph.Identity.DirectoryManagement
+If (!(Get-Module -Name Microsoft.Graph.Identity.DirectoryManagement -ErrorAction SilentlyContinue))
+{
+    Write-Host "Microsoft Graph Identity Directory Management powershell module is not installed" -ForegroundColor Cyan
+    Install-Module -Name Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser -Force | Out-Null
+    Import-Module -Name Microsoft.Graph.Identity.DirectoryManagement
+}
+else
+{
+    Write-Host "The Microsoft Graph Identity Directory Management powershell module is already installe"
+}
+
 #Endregion Install and import Powershell module
 
 # Connect to Microsoft Graph API
