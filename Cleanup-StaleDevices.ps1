@@ -84,6 +84,9 @@
     0.9.5 - The OperatingSystem property now supports Android, iPad, iPhone, iOS and Unknown operating systems 
 #>
 
+#Requires -Version 5.1
+#Requires -Modules {Microsoft.Graph.Identity.DirectoryManagement}
+
 param(
     [Parameter(Mandatory = $false)][ValidateRange(1,5475)]
     [Int32]$DeviceAge = "180",
@@ -116,6 +119,7 @@ function Get-StaleDevices
     }
 }
 
+<#
 #Region Install and import Powershell module
 # Download and install require Powershell modules
 Write-Host "Downloading and installing Powershell modules" -ForegroundColor Cyan
@@ -142,6 +146,7 @@ else
 }
 
 #Endregion Install and import Powershell module
+#>
 
 # Connect to Microsoft Graph API
 Write-Host "Connecting to the Microsoft Graph API" -ForegroundColor Cyan
