@@ -4,8 +4,8 @@
 param(
     [Parameter(Mandatory = $false)][ValidateRange(1, 5475)]
     [Int32]$DeviceAge = 90,
-    [Parameter(Mandatory = $false)][ValidateSet("AzureAD", "ServerAD", "Workplace")]
-    [string]$DeviceJoinType = "AzureAD",
+    [Parameter(Mandatory = $false)][ValidateSet("EntraJoined", "HybridJoined", "Registered")]
+    [string]$DeviceJoinType = "EntraJoined",
     [Parameter(Mandatory = $false)][ValidateSet("Android", "iOS", "Ipad", "Iphone", "Windows", "MacMDM", "Unknown")]
     [string]$OperatingSystem = "Windows",
     [Parameter(Mandatory = $true)]
@@ -22,6 +22,14 @@ if ($DisableDevice -and $RemoveDevice) {
     Write-Error "Cannot use -DisableDevice and -RemoveDevice together. Choose one."
     exit 1
 }
+
+# Translate friendly join type names to Graph API trustType values
+$JoinTypeMap = @{
+    EntraJoined  = "AzureAD"
+    HybridJoined = "ServerAD"
+    Registered   = "Workplace"
+}
+$GraphJoinType = $JoinTypeMap[$DeviceJoinType]
 
 function Get-GraphPagedResults {
     param(
@@ -161,12 +169,12 @@ Clear-Host
 
 # Retrieve devices
 if ($DisabledDevices) {
-    Write-Host "Disabled $OperatingSystem devices (TrustType: $DeviceJoinType)" -ForegroundColor Cyan
-    $Devices = Get-StaleDevices -JoinType $DeviceJoinType -OS $OperatingSystem -DisabledDevices
+    Write-Host "Disabled $OperatingSystem devices (JoinType: $DeviceJoinType)" -ForegroundColor Cyan
+    $Devices = Get-StaleDevices -JoinType $GraphJoinType -OS $OperatingSystem -DisabledDevices
 }
 else {
-    Write-Host "Stale $OperatingSystem devices older than $DeviceAge days (TrustType: $DeviceJoinType)" -ForegroundColor Cyan
-    $Devices = Get-StaleDevices -Age $DeviceAge -JoinType $DeviceJoinType -OS $OperatingSystem
+    Write-Host "Stale $OperatingSystem devices older than $DeviceAge days (JoinType: $DeviceJoinType)" -ForegroundColor Cyan
+    $Devices = Get-StaleDevices -Age $DeviceAge -JoinType $GraphJoinType -OS $OperatingSystem
 }
 
 if (-not $Devices) { exit 0 }
