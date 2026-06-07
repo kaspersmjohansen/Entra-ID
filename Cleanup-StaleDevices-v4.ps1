@@ -1,3 +1,98 @@
+<#PSScriptInfo
+<#
+.SYNOPSIS
+    Identifies and manages stale or disabled devices in Microsoft Entra ID via
+    a browser-based UI backed by a local Microsoft Graph API HTTP listener.
+
+.DESCRIPTION
+    Cleanup-StaleDevices launches a local HTTP server and opens a browser UI
+    for querying, reviewing, and acting on stale or disabled Entra ID devices
+    without requiring any parameters to be typed on the command line.
+
+    Authentication to Microsoft Graph is handled before the UI starts. The script
+    requests Device.ReadWrite.All so both read and write operations are covered
+    by a single cached token, avoiding double login prompts.
+
+    The UI supports:
+      - Filtering by join type (Entra joined, Hybrid joined, Registered)
+      - Filtering by operating system
+      - Querying stale devices by inactivity threshold (days since last sign-in)
+      - Querying all disabled devices regardless of last sign-in
+      - Selecting individual or all devices for bulk action
+      - Disabling selected devices (accountEnabled = false)
+      - Permanently removing selected devices from Entra ID
+      - Exporting results to a CSV file directly from the browser
+      - Colour-coded last sign-in ages (amber > 90 days, red > 180 days)
+
+    Disable and Remove operations include a confirmation dialog in the UI and use
+    a retry loop with Retry-After handling for Graph API throttling (HTTP 429).
+
+    Press Ctrl+C in the PowerShell window to stop the listener and exit.
+
+.PARAMETER Port
+    TCP port for the local HTTP listener. Default is 8734.
+    Change this if the default port is already in use on the machine.
+
+.EXAMPLE
+    .\Cleanup-StaleDevices-v4.ps1
+
+    Connects to Microsoft Graph (browser auth prompt), then opens the UI at
+    http://localhost:8734. Use the UI to set filters and query devices.
+
+.EXAMPLE
+    .\Cleanup-StaleDevices-v4.ps1 -Port 9000
+
+    Starts the listener on port 9000 instead of the default 8734. Useful if
+    another process is already bound to 8734.
+
+.EXAMPLE
+    # Typical stale device cleanup workflow:
+    # 1. Run the script - authenticate in the browser window that opens first.
+    # 2. In the UI, set Join type = Entra joined, OS = Windows, threshold = 90 days.
+    # 3. Click Query devices to retrieve matching devices.
+    # 4. Review the table - last sign-in ages are colour-coded for quick triage.
+    # 5. Select devices to act on, click Disable selected, confirm in the dialog.
+    # 6. Once satisfied, select remaining and click Remove selected.
+    # 7. Press Ctrl+C in the PowerShell window to stop the listener.
+
+.EXAMPLE
+    # Reviewing disabled devices before removal:
+    # 1. Run the script and authenticate.
+    # 2. In the UI, set Device scope = Disabled devices.
+    # 3. Click Query devices - returns all disabled devices regardless of age.
+    # 4. Use Export CSV to save the list before taking any action.
+    # 5. Select all, click Remove selected, confirm.
+
+.NOTES
+    Requires PowerShell 5.1 or later.
+    Requires the following Microsoft Graph PowerShell SDK modules:
+      - Microsoft.Graph.Authentication
+      - Microsoft.Graph.Identity.DirectoryManagement
+
+    The Graph connection uses Device.ReadWrite.All. If an existing session already
+    has this scope for the target tenant it is reused without prompting again.
+
+    Date values (last sign-in, registered) are normalised to ISO 8601 UTC strings
+    before JSON serialisation to avoid the legacy /Date(...)/ format emitted by
+    ConvertTo-Json in Windows PowerShell 5.1 when serialising [datetime] objects.
+
+.AUTHOR
+    Kasper Johansen
+
+.VERSION
+    4.0
+
+.RELEASENOTES
+    v4.0 - Added browser-based UI via embedded HTTP listener. Authentication now
+           happens before the listener starts to avoid thread-blocking issues.
+           Ctrl+C handled cleanly via async BeginGetContext polling.
+    v3.0 - Implemented -DisableDevice and -RemoveDevice actions. Added pagination
+           via Get-GraphPagedResults. Added WhatIf/Confirm support. Moved to
+           Graph API v1.0. Fixed DeviceId vs ObjectId for mutations.
+    v2.0 - Added -DisabledDevices scope, -ExportToCSV, and Graph session reuse.
+    v1.0 - Initial release.
+#>
+
 #Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Identity.DirectoryManagement
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = "High")]
