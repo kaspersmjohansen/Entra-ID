@@ -1,5 +1,5 @@
 <#PSScriptInfo
-<#
+
 .SYNOPSIS
     Identifies and manages stale or disabled devices in Microsoft Entra ID via
     a browser-based UI backed by a local Microsoft Graph API HTTP listener.
@@ -91,7 +91,7 @@
            Graph API v1.0. Fixed DeviceId vs ObjectId for mutations.
     v2.0 - Added -DisabledDevices scope, -ExportToCSV, and Graph session reuse.
     v1.0 - Initial release.
-    
+
 #>
 
 #Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Identity.DirectoryManagement
