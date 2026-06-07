@@ -2,46 +2,23 @@
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = "High")]
 param(
-    [Parameter(Mandatory = $false)][ValidateRange(1, 5475)]
-    [Int32]$DeviceAge = 90,
-    [Parameter(Mandatory = $false)][ValidateSet("EntraJoined", "HybridJoined", "Registered")]
-    [string]$DeviceJoinType = "EntraJoined",
-    [Parameter(Mandatory = $false)][ValidateSet("Android", "iOS", "Ipad", "Iphone", "Windows", "MacMDM", "Unknown")]
-    [string]$OperatingSystem = "Windows",
-    [Parameter(Mandatory = $true)]
-    [string]$TenantId,
-    [switch]$ExportToCSV,
-    [switch]$ListDevice,
-    [switch]$DisableDevice,
-    [switch]$RemoveDevice,
-    [switch]$DisabledDevices
+    [Int32]$Port = 8734
 )
 
-# Mutual exclusion guard
-if ($DisableDevice -and $RemoveDevice) {
-    Write-Error "Cannot use -DisableDevice and -RemoveDevice together. Choose one."
-    exit 1
-}
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-# Translate friendly join type names to Graph API trustType values
 $JoinTypeMap = @{
     EntraJoined  = "AzureAD"
     HybridJoined = "ServerAD"
     Registered   = "Workplace"
 }
-$GraphJoinType = $JoinTypeMap[$DeviceJoinType]
 
 function Get-GraphPagedResults {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Uri
-    )
+    param([string]$Uri)
     $Results = [System.Collections.Generic.List[Object]]::new()
     do {
         $Response = Invoke-MgGraphRequest -Method Get -Uri $Uri -Headers @{ ConsistencyLevel = "eventual" }
-        if ($Response.value) {
-            $Results.AddRange([Object[]]$Response.value)
-        }
+        if ($Response.value) { $Results.AddRange([Object[]]$Response.value) }
         $Uri = $Response.'@odata.nextLink'
     } while ($Uri)
     return $Results
@@ -49,23 +26,16 @@ function Get-GraphPagedResults {
 
 function Invoke-MgGraphRequestWithRetry {
     param(
-        [Parameter(Mandatory = $true)][string]$Method,
-        [Parameter(Mandatory = $true)][string]$Uri,
+        [string]$Method,
+        [string]$Uri,
         [hashtable]$Body,
         [int]$MaxRetries = 3
     )
     $Attempt = 0
     do {
         try {
-            $Params = @{
-                Method      = $Method
-                Uri         = $Uri
-                ErrorAction = "Stop"
-            }
-            if ($Body) {
-                $Params.Body        = ($Body | ConvertTo-Json)
-                $Params.ContentType = "application/json"
-            }
+            $Params = @{ Method = $Method; Uri = $Uri; ErrorAction = "Stop" }
+            if ($Body) { $Params.Body = ($Body | ConvertTo-Json); $Params.ContentType = "application/json" }
             Invoke-MgGraphRequest @Params
             return
         }
@@ -74,163 +44,642 @@ function Invoke-MgGraphRequestWithRetry {
             if ($StatusCode -eq 429 -and $Attempt -lt $MaxRetries) {
                 $RetryAfter = $_.Exception.Response.Headers['Retry-After']
                 $Wait = if ($RetryAfter) { [int]$RetryAfter } else { 10 }
-                Write-Warning "Graph throttled (429). Retrying in $Wait seconds... (attempt $($Attempt + 1) of $MaxRetries)"
                 Start-Sleep -Seconds $Wait
             }
-            else {
-                throw
-            }
+            else { throw }
         }
         $Attempt++
     } while ($Attempt -le $MaxRetries)
 }
 
 function Get-StaleDevices {
-    param(
-        [Parameter(Mandatory = $false)]
-        [Int32]$Age,
-        [Parameter(Mandatory = $true)]
-        [string]$JoinType,
-        [Parameter(Mandatory = $true)]
-        [string]$OS,
-        [switch]$DisabledDevices
-    )
-
-    $BaseUri = "https://graph.microsoft.com/v1.0"
-    # id = AAD object id (required for PATCH/DELETE); deviceId = hardware-bound Entra device id
+    param([Int32]$Age, [string]$JoinType, [string]$OS, [switch]$DisabledDevices)
+    $Base   = "https://graph.microsoft.com/v1.0"
     $Select = "id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,approximateLastSignInDateTime,registrationDateTime,accountEnabled"
-
     if ($DisabledDevices) {
-        $Uri = "$BaseUri/devices?`$filter=operatingSystem eq '$OS' AND trustType eq '$JoinType' AND accountEnabled eq false&`$count=true&`$select=$Select"
-        $RawDevices = Get-GraphPagedResults -Uri $Uri
-
-        if ($RawDevices.Count -eq 0) {
-            Write-Host "No disabled $OS devices found with TrustType '$JoinType'." -ForegroundColor Yellow
-            return $null
-        }
+        $Uri = "$Base/devices?`$filter=operatingSystem eq '$OS' AND trustType eq '$JoinType' AND accountEnabled eq false&`$count=true&`$select=$Select"
     }
     else {
         $DevAge = (Get-Date).AddDays(-$Age).ToString("yyyy-MM-ddTHH:mm:ssZ")
-        $Uri = "$BaseUri/devices?`$filter=approximateLastSignInDateTime le $DevAge AND operatingSystem eq '$OS' AND trustType eq '$JoinType'&`$count=true&`$select=$Select"
-        $RawDevices = Get-GraphPagedResults -Uri $Uri
-
-        if ($RawDevices.Count -eq 0) {
-            Write-Host "No stale $OS devices found older than $Age days with TrustType '$JoinType'." -ForegroundColor Yellow
-            return $null
-        }
+        $Uri = "$Base/devices?`$filter=approximateLastSignInDateTime le $DevAge AND operatingSystem eq '$OS' AND trustType eq '$JoinType'&`$count=true&`$select=$Select"
     }
-
-    $ListView = foreach ($Device in $RawDevices) {
+    $Raw = Get-GraphPagedResults -Uri $Uri
+    return $Raw | ForEach-Object {
         [PSCustomObject]@{
-            ObjectId               = $Device.id
-            DeviceId               = $Device.deviceId
-            DisplayName            = $Device.displayName
-            OperatingSystem        = $Device.operatingSystem
-            OperatingSystemVersion = $Device.operatingSystemVersion
-            TrustType              = $Device.trustType
-            LastSignInDateTime     = $Device.approximateLastSignInDateTime
-            RegistrationDateTime   = $Device.registrationDateTime
-            AccountEnabled         = $Device.accountEnabled
+            objectId               = $_.id
+            deviceId               = $_.deviceId
+            displayName            = $_.displayName
+            operatingSystem        = $_.operatingSystem
+            operatingSystemVersion = $_.operatingSystemVersion
+            trustType              = $_.trustType
+            lastSignIn             = if ($_.approximateLastSignInDateTime) { ([datetime]$_.approximateLastSignInDateTime).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null }
+            registered             = if ($_.registrationDateTime) { ([datetime]$_.registrationDateTime).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null }
+            accountEnabled         = $_.accountEnabled
         }
-    }
-
-    return $ListView | Sort-Object LastSignInDateTime
+    } | Sort-Object lastSignIn
 }
 
-# Connect to Microsoft Graph - reuse existing session if tenant and scopes match
-$ctx = Get-MgContext
-$NeedsWrite = $DisableDevice -or $RemoveDevice
-$RequiredScope = if ($NeedsWrite) { "Device.ReadWrite.All" } else { "Device.Read.All" }
+function Write-JsonResponse {
+    param($Context, [int]$Status = 200, $Body)
+    $Json  = $Body | ConvertTo-Json -Depth 5 -Compress
+    $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
+    $Context.Response.StatusCode        = $Status
+    $Context.Response.ContentType       = "application/json"
+    $Context.Response.ContentLength64   = $Bytes.Length
+    $Context.Response.Headers.Add("Access-Control-Allow-Origin", "*")
+    $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
+    $Context.Response.OutputStream.Close()
+}
 
-$SessionValid = $ctx -and ($ctx.TenantId -eq $TenantId)
-$ScopesMissing = $SessionValid -and $NeedsWrite -and ($ctx.Scopes -notcontains "Device.ReadWrite.All")
+function Write-HtmlResponse {
+    param($Context, [string]$Html)
+    $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Html)
+    $Context.Response.StatusCode        = 200
+    $Context.Response.ContentType       = "text/html; charset=utf-8"
+    $Context.Response.ContentLength64   = $Bytes.Length
+    $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
+    $Context.Response.OutputStream.Close()
+}
 
-if ($ScopesMissing) {
-    Write-Error "Current Graph session lacks Device.ReadWrite.All. Reconnect without an existing session, or omit -DisableDevice/-RemoveDevice."
+# ── embedded HTML ─────────────────────────────────────────────────────────────
+
+$Html = @'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Cleanup-StaleDevices</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#ffffff;--bg2:#f5f5f4;--bg3:#eeede9;
+  --border:rgba(0,0,0,.10);--border2:rgba(0,0,0,.18);
+  --text:#1a1a18;--text2:#5a5a56;--text3:#9a9a95;
+  --radius:8px;--radius-lg:12px;
+  --mono:'Consolas','Menlo',monospace;
+  --accent:#185FA5;--accent-bg:#E6F1FB;
+  --warn:#BA7517;--warn-bg:#FAEEDA;
+  --danger:#A32D2D;--danger-bg:#FCEBEB;--danger-bd:#F09595;
+  --success:#0F6E56;--success-bg:#E1F5EE;
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#1c1c1a;--bg2:#252523;--bg3:#2e2e2b;
+  --border:rgba(255,255,255,.10);--border2:rgba(255,255,255,.18);
+  --text:#e8e8e4;--text2:#a0a09a;--text3:#6a6a65;
+  --accent:#85B7EB;--accent-bg:#0C447C;
+  --warn:#FAC775;--warn-bg:#633806;
+  --danger:#F09595;--danger-bg:#501313;--danger-bd:#791F1F;
+  --success:#5DCAA5;--success-bg:#04342C;
+}}
+body{font-family:-apple-system,'Segoe UI',sans-serif;background:var(--bg3);color:var(--text);font-size:14px;line-height:1.5;min-height:100vh;padding:2rem 1rem}
+.shell{max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
+.header{display:flex;align-items:baseline;gap:10px;padding-bottom:4px}
+.header h1{font-size:17px;font-weight:600}
+.header span{font-size:12px;color:var(--text3)}
+.card{background:var(--bg);border:.5px solid var(--border);border-radius:var(--radius-lg);padding:1rem 1.25rem}
+.section-label{font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:10px}
+.field{display:flex;flex-direction:column;gap:4px}
+.field label{font-size:12px;color:var(--text2)}
+input[type=text],input[type=number],select{font-family:inherit;font-size:13px;color:var(--text);background:var(--bg2);border:.5px solid var(--border2);border-radius:var(--radius);padding:7px 10px;width:100%;outline:none;transition:border-color .15s;appearance:none}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 18%,transparent)}
+select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;padding-right:28px;cursor:pointer}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.age-row{display:flex;align-items:center;gap:10px;margin-top:2px}
+input[type=range]{flex:1;height:4px;cursor:pointer;accent-color:var(--accent)}
+.age-num-wrap{display:flex;align-items:center;gap:5px}
+.age-num-wrap input{width:64px;text-align:right}
+.age-unit{font-size:12px;color:var(--text2);white-space:nowrap}
+.run-btn{display:inline-flex;align-items:center;gap:7px;font-family:inherit;font-size:13px;font-weight:500;padding:8px 18px;border-radius:var(--radius);border:none;background:var(--accent);color:#fff;cursor:pointer;transition:opacity .15s}
+.run-btn:hover{opacity:.88}
+.run-btn:disabled{opacity:.45;cursor:not-allowed}
+.status-bar{font-size:12px;color:var(--text3);display:flex;align-items:center;gap:7px}
+.spinner{width:13px;height:13px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0;display:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.connect-row{display:flex;align-items:flex-end;gap:10px}
+.connect-row .field{flex:1}
+.connect-pill{font-size:11px;padding:3px 9px;border-radius:20px;font-weight:500;white-space:nowrap}
+.pill-ok{background:var(--success-bg);color:var(--success)}
+.pill-no{background:var(--danger-bg);color:var(--danger)}
+
+/* results area */
+.results-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px}
+.results-title{font-size:13px;font-weight:500}
+.count-badge{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg2);color:var(--text2);border:.5px solid var(--border)}
+.action-bar{display:flex;gap:6px;flex-wrap:wrap}
+.action-btn{display:inline-flex;align-items:center;gap:5px;font-family:inherit;font-size:12px;padding:5px 11px;border-radius:var(--radius);border:.5px solid var(--border2);background:var(--bg);color:var(--text2);cursor:pointer;transition:background .1s}
+.action-btn:hover{background:var(--bg2)}
+.action-btn.danger{border-color:var(--danger-bd);color:var(--danger)}
+.action-btn.danger:hover{background:var(--danger-bg)}
+.action-btn.warn{border-color:var(--warn);color:var(--warn)}
+.action-btn.warn:hover{background:var(--warn-bg)}
+.action-btn:disabled{opacity:.4;cursor:not-allowed}
+
+/* table */
+.tbl-wrap{overflow-x:auto;border-radius:var(--radius);border:.5px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+thead th{background:var(--bg2);padding:7px 10px;text-align:left;font-weight:500;font-size:11.5px;color:var(--text2);white-space:nowrap;border-bottom:.5px solid var(--border);position:sticky;top:0}
+tbody tr{border-bottom:.5px solid var(--border);transition:background .1s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:var(--bg2)}
+tbody tr.selected{background:var(--accent-bg)}
+tbody td{padding:7px 10px;color:var(--text);vertical-align:middle}
+.td-check{width:32px;text-align:center}
+input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;cursor:pointer}
+.badge-enabled{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--success-bg);color:var(--success)}
+.badge-disabled{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--danger-bg);color:var(--danger)}
+.stale-age{color:var(--danger);font-weight:500}
+.old-age{color:var(--warn)}
+.empty-state{padding:2rem;text-align:center;color:var(--text3);font-size:13px}
+.confirm-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:100;display:none}
+.confirm-card{background:var(--bg);border:.5px solid var(--border2);border-radius:var(--radius-lg);padding:1.5rem;width:380px;max-width:90vw}
+.confirm-card h2{font-size:15px;font-weight:600;margin-bottom:6px}
+.confirm-card p{font-size:13px;color:var(--text2);margin-bottom:1.25rem;line-height:1.6}
+.confirm-btns{display:flex;gap:8px;justify-content:flex-end}
+.btn-cancel{font-family:inherit;font-size:13px;padding:7px 14px;border-radius:var(--radius);border:.5px solid var(--border2);background:var(--bg);color:var(--text2);cursor:pointer}
+.btn-cancel:hover{background:var(--bg2)}
+.btn-confirm-danger{font-family:inherit;font-size:13px;font-weight:500;padding:7px 14px;border-radius:var(--radius);border:none;background:var(--danger);color:#fff;cursor:pointer}
+.btn-confirm-warn{font-family:inherit;font-size:13px;font-weight:500;padding:7px 14px;border-radius:var(--radius);border:none;background:var(--warn);color:#fff;cursor:pointer}
+.log-list{display:flex;flex-direction:column;gap:3px;max-height:180px;overflow-y:auto;margin-top:10px}
+.log-item{font-size:12px;font-family:var(--mono);padding:4px 8px;border-radius:4px;background:var(--bg2)}
+.log-ok{color:var(--success)}
+.log-err{color:var(--danger)}
+.log-info{color:var(--text2)}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="header">
+    <h1>Cleanup-StaleDevices</h1>
+    <span>v4</span>
+  </div>
+
+  <!-- Connection status -->
+  <div class="card" id="statusCard">
+    <div style="display:flex;align-items:center;gap:10px">
+      <div class="spinner" id="statusSpinner" style="display:block"></div>
+      <span id="statusMsg" style="font-size:13px;color:var(--text2)">Checking connection...</span>
+      <span id="connectPill" class="connect-pill" style="display:none"></span>
+    </div>
+  </div>
+
+  <!-- Filters -->
+  <div class="card">
+    <div class="section-label">Device filter</div>
+    <div class="grid3" style="margin-bottom:12px">
+      <div class="field">
+        <label>Join type</label>
+        <select id="joinType">
+          <option value="EntraJoined">Entra joined</option>
+          <option value="HybridJoined">Hybrid joined</option>
+          <option value="Registered">Registered</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Operating system</label>
+        <select id="os">
+          <option value="Windows">Windows</option>
+          <option value="iOS">iOS</option>
+          <option value="Android">Android</option>
+          <option value="MacMDM">macOS MDM</option>
+          <option value="Ipad">iPad</option>
+          <option value="Iphone">iPhone</option>
+          <option value="Unknown">Unknown</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Device scope</label>
+        <select id="scope" onchange="toggleAgeRow()">
+          <option value="stale">Stale devices</option>
+          <option value="disabled">Disabled devices</option>
+        </select>
+      </div>
+    </div>
+    <div id="ageRow" class="field">
+      <label>Inactivity threshold</label>
+      <div class="age-row">
+        <input type="range" id="ageSlider" min="1" max="365" value="90" step="1" oninput="syncAge(this.value,false)" />
+        <div class="age-num-wrap">
+          <input type="number" id="ageNum" min="1" max="5475" value="90" oninput="syncAge(this.value,true)" />
+          <span class="age-unit">days</span>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px">
+      <div class="status-bar">
+        <div class="spinner" id="querySpinner"></div>
+        <span id="queryStatusMsg"></span>
+      </div>
+      <button class="run-btn" id="queryBtn" onclick="runQuery()" disabled>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        Query devices
+      </button>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div class="card" id="resultsCard" style="display:none">
+    <div class="results-header">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="results-title">Results</span>
+        <span class="count-badge" id="countBadge">0 devices</span>
+        <span class="count-badge" id="selBadge" style="display:none">0 selected</span>
+      </div>
+      <div class="action-bar">
+        <button class="action-btn" onclick="selectAll()">Select all</button>
+        <button class="action-btn" onclick="clearSel()">Clear</button>
+        <button class="action-btn warn" id="disableBtn" onclick="confirmAction('disable')" disabled>Disable selected</button>
+        <button class="action-btn danger" id="removeBtn" onclick="confirmAction('remove')" disabled>Remove selected</button>
+        <button class="action-btn" onclick="exportCSV()">Export CSV</button>
+      </div>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th class="td-check"><input type="checkbox" id="checkAll" onchange="toggleAll(this.checked)" /></th>
+            <th>Device name</th>
+            <th>OS</th>
+            <th>Version</th>
+            <th>Join type</th>
+            <th>Last sign-in</th>
+            <th>Registered</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="tblBody"></tbody>
+      </table>
+    </div>
+    <div class="log-list" id="logList" style="display:none"></div>
+  </div>
+</div>
+
+<!-- Confirm overlay -->
+<div class="confirm-overlay" id="confirmOverlay">
+  <div class="confirm-card">
+    <h2 id="confirmTitle"></h2>
+    <p id="confirmMsg"></p>
+    <div class="confirm-btns">
+      <button class="btn-cancel" onclick="closeConfirm()">Cancel</button>
+      <button id="confirmOkBtn" onclick="executeAction()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let devices = [];
+let pendingAction = null;
+
+function syncAge(val, fromNum) {
+  const n = Math.max(1, Math.min(5475, parseInt(val) || 1));
+  document.getElementById('ageSlider').value = Math.min(n, 365);
+  document.getElementById('ageNum').value = n;
+}
+
+function toggleAgeRow() {
+  document.getElementById('ageRow').style.display =
+    document.getElementById('scope').value === 'disabled' ? 'none' : '';
+}
+
+function setQueryStatus(msg, spinning) {
+  document.getElementById('queryStatusMsg').textContent = msg;
+  document.getElementById('querySpinner').style.display = spinning ? 'block' : 'none';
+}
+
+async function checkStatus() {
+  try {
+    const r = await fetch('/status');
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('statusSpinner').style.display = 'none';
+      document.getElementById('statusMsg').textContent = 'Connected to tenant ' + d.tenant;
+      document.getElementById('statusMsg').style.color = 'var(--success)';
+      const pill = document.getElementById('connectPill');
+      pill.textContent = 'Connected';
+      pill.className = 'connect-pill pill-ok';
+      pill.style.display = '';
+      document.getElementById('queryBtn').disabled = false;
+    }
+  } catch (e) {
+    document.getElementById('statusSpinner').style.display = 'none';
+    document.getElementById('statusMsg').textContent = 'Not connected — restart the script.';
+    document.getElementById('statusMsg').style.color = 'var(--danger)';
+  }
+}
+
+window.addEventListener('load', checkStatus);
+
+async function runQuery() {
+  document.getElementById('queryBtn').disabled = true;
+  document.getElementById('resultsCard').style.display = 'none';
+  setQueryStatus('Querying Graph...', true);
+  const body = {
+    joinType:  document.getElementById('joinType').value,
+    os:        document.getElementById('os').value,
+    scope:     document.getElementById('scope').value,
+    age:       parseInt(document.getElementById('ageNum').value) || 90
+  };
+  try {
+    const r = await fetch('/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (d.ok) {
+      devices = d.devices;
+      renderTable(devices);
+      setQueryStatus(`Found ${devices.length} device${devices.length !== 1 ? 's' : ''}.`, false);
+    } else {
+      setQueryStatus('Query failed: ' + d.error, false);
+    }
+  } catch (e) {
+    setQueryStatus('Query failed: ' + e.message, false);
+  }
+  document.getElementById('queryBtn').disabled = false;
+}
+
+function renderTable(devs) {
+  const tbody = document.getElementById('tblBody');
+  if (!devs.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No devices found.</td></tr>';
+    document.getElementById('countBadge').textContent = '0 devices';
+    document.getElementById('resultsCard').style.display = '';
+    document.getElementById('logList').style.display = 'none';
+    return;
+  }
+  tbody.innerHTML = devs.map((d, i) => {
+    const parseDate = v => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d; };
+    const lastSignIn = parseDate(d.lastSignIn);
+    const registered = parseDate(d.registered);
+    const daysSince  = lastSignIn ? Math.floor((Date.now() - lastSignIn.getTime()) / 86400000) : null;
+    const ageClass   = daysSince === null ? '' : daysSince > 180 ? 'stale-age' : daysSince > 90 ? 'old-age' : '';
+    const ageStr     = daysSince === null ? '—' : `<span class="${ageClass}">${daysSince}d ago</span>`;
+    const regStr     = registered ? registered.toLocaleDateString() : '—';
+    const statusBadge = d.accountEnabled
+      ? '<span class="badge-enabled">Enabled</span>'
+      : '<span class="badge-disabled">Disabled</span>';
+    const jt = { AzureAD: 'Entra joined', ServerAD: 'Hybrid joined', Workplace: 'Registered' };
+    return `<tr id="row-${i}">
+      <td class="td-check"><input type="checkbox" data-idx="${i}" onchange="onRowCheck(${i},this.checked)" /></td>
+      <td style="font-weight:500">${esc(d.displayName)}</td>
+      <td>${esc(d.operatingSystem||'—')}</td>
+      <td style="color:var(--text2)">${esc(d.operatingSystemVersion||'—')}</td>
+      <td>${jt[d.trustType]||esc(d.trustType)||'—'}</td>
+      <td>${ageStr}</td>
+      <td style="color:var(--text2)">${regStr}</td>
+      <td>${statusBadge}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('countBadge').textContent = `${devs.length} device${devs.length !== 1 ? 's' : ''}`;
+  document.getElementById('resultsCard').style.display = '';
+  document.getElementById('logList').style.display = 'none';
+  document.getElementById('logList').innerHTML = '';
+  updateSelectionUI();
+}
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function getSelected() {
+  return [...document.querySelectorAll('#tblBody input[type=checkbox]:checked')]
+    .map(cb => parseInt(cb.dataset.idx));
+}
+
+function onRowCheck(i, checked) {
+  document.getElementById('row-' + i).classList.toggle('selected', checked);
+  updateSelectionUI();
+}
+
+function toggleAll(checked) {
+  document.querySelectorAll('#tblBody input[type=checkbox]').forEach(cb => {
+    cb.checked = checked;
+    const i = parseInt(cb.dataset.idx);
+    document.getElementById('row-' + i).classList.toggle('selected', checked);
+  });
+  updateSelectionUI();
+}
+
+function selectAll() { document.getElementById('checkAll').checked = true; toggleAll(true); }
+function clearSel()  { document.getElementById('checkAll').checked = false; toggleAll(false); }
+
+function updateSelectionUI() {
+  const sel = getSelected();
+  const n   = sel.length;
+  const sb  = document.getElementById('selBadge');
+  sb.textContent = `${n} selected`;
+  sb.style.display = n ? '' : 'none';
+  document.getElementById('disableBtn').disabled = n === 0;
+  document.getElementById('removeBtn').disabled  = n === 0;
+}
+
+function confirmAction(action) {
+  const sel  = getSelected();
+  const n    = sel.length;
+  pendingAction = action;
+  document.getElementById('confirmTitle').textContent =
+    action === 'disable' ? `Disable ${n} device${n !== 1 ? 's' : ''}?` : `Remove ${n} device${n !== 1 ? 's' : ''}?`;
+  document.getElementById('confirmMsg').textContent =
+    action === 'disable'
+      ? `This will set accountEnabled = false on ${n} device${n !== 1 ? 's' : ''} in Entra ID. This can be undone.`
+      : `This will permanently delete ${n} device${n !== 1 ? 's' : ''} from Entra ID. This cannot be undone.`;
+  const okBtn = document.getElementById('confirmOkBtn');
+  okBtn.className = action === 'disable' ? 'btn-confirm-warn' : 'btn-confirm-danger';
+  okBtn.textContent = action === 'disable' ? 'Disable' : 'Remove';
+  document.getElementById('confirmOverlay').style.display = 'flex';
+}
+
+function closeConfirm() {
+  document.getElementById('confirmOverlay').style.display = 'none';
+  pendingAction = null;
+}
+
+async function executeAction() {
+  closeConfirm();
+  const sel     = getSelected();
+  const targets = sel.map(i => devices[i]);
+  const logList = document.getElementById('logList');
+  logList.style.display = 'flex';
+  logList.innerHTML = `<div class="log-item log-info">Starting ${pendingAction} on ${targets.length} device(s)...</div>`;
+
+  document.getElementById('disableBtn').disabled = true;
+  document.getElementById('removeBtn').disabled  = true;
+
+  for (const dev of targets) {
+    try {
+      const r = await fetch('/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: pendingAction, objectId: dev.objectId, displayName: dev.displayName })
+      });
+      const d = await r.json();
+      const item = document.createElement('div');
+      item.className = 'log-item ' + (d.ok ? 'log-ok' : 'log-err');
+      item.textContent = d.ok
+        ? `✓ ${dev.displayName}`
+        : `✗ ${dev.displayName} — ${d.error}`;
+      logList.appendChild(item);
+      logList.scrollTop = logList.scrollHeight;
+      if (d.ok) {
+        const idx = devices.indexOf(dev);
+        const row = document.getElementById('row-' + idx);
+        if (row) row.style.opacity = '0.4';
+      }
+    } catch (e) {
+      const item = document.createElement('div');
+      item.className = 'log-item log-err';
+      item.textContent = `✗ ${dev.displayName} — ${e.message}`;
+      logList.appendChild(item);
+    }
+  }
+
+  const done = document.createElement('div');
+  done.className = 'log-item log-info';
+  done.textContent = 'Done.';
+  logList.appendChild(done);
+  updateSelectionUI();
+}
+
+function exportCSV() {
+  if (!devices.length) return;
+  const headers = ['DisplayName','DeviceId','OS','Version','JoinType','LastSignIn','Registered','AccountEnabled'];
+  const rows = devices.map(d => [
+    d.displayName, d.deviceId, d.operatingSystem, d.operatingSystemVersion,
+    d.trustType, d.lastSignIn||'', d.registered||'', d.accountEnabled
+  ].map(v => `"${String(v||'').replace(/"/g,'""')}"`).join(','));
+  const csv  = [headers.join(','), ...rows].join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = `StaleDevices_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click(); URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>
+'@
+
+# ── Connect to Graph before starting the listener ─────────────────────────────
+# Connect-MgGraph opens an interactive browser auth flow which blocks the thread.
+# It must complete before the HttpListener loop starts, otherwise the listener
+# cannot accept requests while waiting for the auth to finish.
+
+Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
+Write-Host "A browser window will open for authentication." -ForegroundColor Gray
+
+$ConnectedTenantId = $null
+try {
+    $ExistingCtx = Get-MgContext
+    if ($ExistingCtx -and ($ExistingCtx.Scopes -contains "Device.ReadWrite.All")) {
+        Write-Host "Reusing existing Graph session for tenant $($ExistingCtx.TenantId)." -ForegroundColor Green
+        $ConnectedTenantId = $ExistingCtx.TenantId
+    }
+    else {
+        Connect-MgGraph -Scopes "Device.ReadWrite.All" -NoWelcome -ErrorAction Stop
+        $ConnectedTenantId = (Get-MgContext).TenantId
+        Write-Host "Connected to tenant $ConnectedTenantId." -ForegroundColor Green
+    }
+}
+catch {
+    Write-Error "Graph connection failed: $($_.Exception.Message)"
     exit 1
 }
 
-if (-not $SessionValid) {
-    Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
-    try {
-        Connect-MgGraph -Scopes $RequiredScope -TenantId $TenantId -NoWelcome -ErrorAction Stop
-        Write-Host "Connected successfully." -ForegroundColor Green
+# ── HTTP listener ─────────────────────────────────────────────────────────────
+# GetContext() blocks the thread permanently, so Ctrl+C can never land.
+# BeginGetContext() + WaitOne(500) polls every 500 ms, keeping the thread
+# responsive to interrupts while still processing every incoming request.
+
+function Invoke-RequestHandler {
+    param($ctx)
+    $req  = $ctx.Request
+    $path = $req.Url.AbsolutePath
+
+    if ($path -eq "/" -or $path -eq "/index.html") {
+        Write-HtmlResponse -Context $ctx -Html $Html
+        return
     }
-    catch {
-        Write-Error "Connection failed: $($_.Exception.Message)"
-        exit 1
+
+    $Body = $null
+    if ($req.HasEntityBody) {
+        $Reader = [System.IO.StreamReader]::new($req.InputStream, $req.ContentEncoding)
+        $Body   = $Reader.ReadToEnd() | ConvertFrom-Json
+        $Reader.Close()
     }
-}
-else {
-    Write-Host "Reusing existing Graph session for tenant $($ctx.TenantId)." -ForegroundColor Green
-}
 
-Clear-Host
+    switch ($path) {
 
-# Retrieve devices
-if ($DisabledDevices) {
-    Write-Host "Disabled $OperatingSystem devices (JoinType: $DeviceJoinType)" -ForegroundColor Cyan
-    $Devices = Get-StaleDevices -JoinType $GraphJoinType -OS $OperatingSystem -DisabledDevices
-}
-else {
-    Write-Host "Stale $OperatingSystem devices older than $DeviceAge days (JoinType: $DeviceJoinType)" -ForegroundColor Cyan
-    $Devices = Get-StaleDevices -Age $DeviceAge -JoinType $GraphJoinType -OS $OperatingSystem
-}
+        "/status" {
+            Write-JsonResponse -Context $ctx -Body @{ ok = $true; tenant = $ConnectedTenantId }
+        }
 
-if (-not $Devices) { exit 0 }
-
-Write-Host "Found $(@($Devices).Count) device(s)." -ForegroundColor Cyan
-
-# List
-if ($ListDevice) {
-    $Devices | Format-Table -AutoSize
-}
-
-# Export
-if ($ExportToCSV) {
-    $ExportPath = ".\StaleDevices_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-    $Devices | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
-    Write-Host "Exported $(@($Devices).Count) devices to $ExportPath" -ForegroundColor Green
-}
-
-# Disable
-if ($DisableDevice) {
-    Write-Host "Disabling $(@($Devices).Count) device(s)..." -ForegroundColor Yellow
-    foreach ($Device in $Devices) {
-        Write-Host "  Processing: $($Device.DisplayName) [$($Device.DeviceId)]"
-        if ($PSCmdlet.ShouldProcess($Device.DisplayName, "Disable")) {
+        "/query" {
             try {
-                Invoke-MgGraphRequestWithRetry -Method Patch `
-                    -Uri "https://graph.microsoft.com/v1.0/devices/$($Device.ObjectId)" `
-                    -Body @{ accountEnabled = $false }
-                Write-Host "  Disabled: $($Device.DisplayName)" -ForegroundColor Green
+                $JoinType = $JoinTypeMap[$Body.joinType]
+                if (-not $JoinType) { throw "Unknown join type: $($Body.joinType)" }
+                $Params = @{ JoinType = $JoinType; OS = $Body.os }
+                if ($Body.scope -eq "disabled") { $Params.DisabledDevices = $true }
+                else { $Params.Age = [int]$Body.age }
+                $Result = Get-StaleDevices @Params
+                Write-JsonResponse -Context $ctx -Body @{ ok = $true; devices = @($Result) }
             }
             catch {
-                Write-Warning "  Failed to disable $($Device.DisplayName): $($_.Exception.Message)"
+                Write-JsonResponse -Context $ctx -Body @{ ok = $false; error = $_.Exception.Message }
             }
+        }
+
+        "/action" {
+            try {
+                $ObjectId = $Body.objectId
+                $Action   = $Body.action
+                if ($Action -eq "disable") {
+                    Invoke-MgGraphRequestWithRetry -Method Patch `
+                        -Uri "https://graph.microsoft.com/v1.0/devices/$ObjectId" `
+                        -Body @{ accountEnabled = $false }
+                }
+                elseif ($Action -eq "remove") {
+                    Invoke-MgGraphRequestWithRetry -Method Delete `
+                        -Uri "https://graph.microsoft.com/v1.0/devices/$ObjectId"
+                }
+                else { throw "Unknown action: $Action" }
+                Write-JsonResponse -Context $ctx -Body @{ ok = $true }
+            }
+            catch {
+                Write-JsonResponse -Context $ctx -Body @{ ok = $false; error = $_.Exception.Message }
+            }
+        }
+
+        default {
+            $ctx.Response.StatusCode = 404
+            $ctx.Response.Close()
         }
     }
 }
 
-# Remove
-if ($RemoveDevice) {
-    Write-Host "Removing $(@($Devices).Count) device(s)..." -ForegroundColor Yellow
-    foreach ($Device in $Devices) {
-        Write-Host "  Processing: $($Device.DisplayName) [$($Device.DeviceId)]"
-        if ($PSCmdlet.ShouldProcess($Device.DisplayName, "Remove")) {
-            try {
-                Invoke-MgGraphRequestWithRetry -Method Delete `
-                    -Uri "https://graph.microsoft.com/v1.0/devices/$($Device.ObjectId)"
-                Write-Host "  Removed: $($Device.DisplayName)" -ForegroundColor Green
-            }
-            catch {
-                Write-Warning "  Failed to remove $($Device.DisplayName): $($_.Exception.Message)"
-            }
+$BaseUrl = "http://localhost:$Port/"
+$Listener = [System.Net.HttpListener]::new()
+$Listener.Prefixes.Add($BaseUrl)
+$Listener.Start()
+
+Write-Host "UI running at $BaseUrl" -ForegroundColor Cyan
+Write-Host "Press Ctrl+C to stop." -ForegroundColor Gray
+Start-Process $BaseUrl
+
+try {
+    while ($Listener.IsListening) {
+        $Async = $Listener.BeginGetContext($null, $null)
+        # Poll every 500 ms so Ctrl+C is never blocked longer than half a second
+        while (-not $Async.AsyncWaitHandle.WaitOne(500)) {
+            if (-not $Listener.IsListening) { break }
         }
+        if (-not $Listener.IsListening) { break }
+        $ctx = $Listener.EndGetContext($Async)
+        Invoke-RequestHandler -ctx $ctx
     }
 }
-
-# Default output if no action switch was specified
-if (-not ($ListDevice -or $ExportToCSV -or $DisableDevice -or $RemoveDevice)) {
-    $Devices | Format-Table -AutoSize
+finally {
+    $Listener.Stop()
+    Write-Host "Listener stopped." -ForegroundColor Gray
 }
