@@ -1,4 +1,47 @@
 <#PSScriptInfo
+.VERSION
+    4.0
+
+.GUID
+    e3b2f1a7-4c8d-4e9f-b1d2-7a6c5e8f3b2d
+
+.AUTHOR
+    Kasper Johansen
+
+.COMPANYNAME
+    KMJ-Consulting
+
+.COPYRIGHT
+    (c) Kasper Johansen. All rights reserved.
+
+.TAGS
+    Intune, EntraID, AzureAD, GraphAPI, DeviceManagement, StaleDevices, MDM, MEM
+
+.LICENSEURI
+
+.PROJECTURI
+    https://kasperjohansen.net
+
+.ICONURI
+
+.EXTERNALMODULEDEPENDENCIES
+    Microsoft.Graph.Authentication, Microsoft.Graph.Identity.DirectoryManagement
+
+.REQUIREDSCRIPTS
+
+.EXTERNALSCRIPTDEPENDENCIES
+
+.RELEASENOTES
+    v4.0 - Added browser-based UI via embedded HTTP listener. Authentication now
+           happens before the listener starts to avoid thread-blocking issues.
+           Ctrl+C handled cleanly via async BeginGetContext polling.
+    v3.0 - Implemented -DisableDevice and -RemoveDevice actions. Added pagination
+           via Get-GraphPagedResults. Added WhatIf/Confirm support. Moved to
+           Graph API v1.0. Fixed DeviceId vs ObjectId for mutations.
+    v2.0 - Added -DisabledDevices scope, -ExportToCSV, and Graph session reuse.
+    v1.0 - Initial release.
+#>
+
 <#
 .SYNOPSIS
     Identifies and manages stale or disabled devices in Microsoft Entra ID via
@@ -76,21 +119,11 @@
     before JSON serialisation to avoid the legacy /Date(...)/ format emitted by
     ConvertTo-Json in Windows PowerShell 5.1 when serialising [datetime] objects.
 
-.AUTHOR
-    Kasper Johansen
+.LINK
+    https://kasperjohansen.net
 
-.VERSION
-    4.0
-
-.RELEASENOTES
-    v4.0 - Added browser-based UI via embedded HTTP listener. Authentication now
-           happens before the listener starts to avoid thread-blocking issues.
-           Ctrl+C handled cleanly via async BeginGetContext polling.
-    v3.0 - Implemented -DisableDevice and -RemoveDevice actions. Added pagination
-           via Get-GraphPagedResults. Added WhatIf/Confirm support. Moved to
-           Graph API v1.0. Fixed DeviceId vs ObjectId for mutations.
-    v2.0 - Added -DisabledDevices scope, -ExportToCSV, and Graph session reuse.
-    v1.0 - Initial release.
+.LINK
+    https://learn.microsoft.com/en-us/graph/api/resources/device
 #>
 
 #Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Identity.DirectoryManagement
@@ -665,6 +698,7 @@ Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
 Write-Host "A browser window will open for authentication." -ForegroundColor Gray
 
 $ConnectedTenantId = $null
+$ConnectedDomain   = $null
 try {
     $ExistingCtx = Get-MgContext
     if ($ExistingCtx -and ($ExistingCtx.Scopes -contains "Device.ReadWrite.All")) {
@@ -676,6 +710,11 @@ try {
         $ConnectedTenantId = (Get-MgContext).TenantId
         Write-Host "Connected to tenant $ConnectedTenantId." -ForegroundColor Green
     }
+    # Resolve primary domain from the organization object
+    $OrgResponse = Invoke-MgGraphRequest -Method Get -Uri "https://graph.microsoft.com/v1.0/organization?`$select=verifiedDomains" -ErrorAction Stop
+    $ConnectedDomain = ($OrgResponse.value[0].verifiedDomains | Where-Object { $_.isDefault -eq $true }).name
+    if (-not $ConnectedDomain) { $ConnectedDomain = $ConnectedTenantId }
+    Write-Host "Primary domain: $ConnectedDomain" -ForegroundColor Green
 }
 catch {
     Write-Error "Graph connection failed: $($_.Exception.Message)"
@@ -707,7 +746,7 @@ function Invoke-RequestHandler {
     switch ($path) {
 
         "/status" {
-            Write-JsonResponse -Context $ctx -Body @{ ok = $true; tenant = $ConnectedTenantId }
+            Write-JsonResponse -Context $ctx -Body @{ ok = $true; tenant = $ConnectedDomain }
         }
 
         "/query" {
