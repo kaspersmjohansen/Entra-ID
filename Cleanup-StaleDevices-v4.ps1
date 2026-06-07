@@ -1,47 +1,4 @@
 <#PSScriptInfo
-.VERSION
-    4.0
-
-.GUID
-    e3b2f1a7-4c8d-4e9f-b1d2-7a6c5e8f3b2d
-
-.AUTHOR
-    Kasper Johansen
-
-.COMPANYNAME
-    KMJ-Consulting
-
-.COPYRIGHT
-    (c) Kasper Johansen. All rights reserved.
-
-.TAGS
-    Intune, EntraID, AzureAD, GraphAPI, DeviceManagement, StaleDevices, MDM, MEM
-
-.LICENSEURI
-
-.PROJECTURI
-    https://kasperjohansen.net
-
-.ICONURI
-
-.EXTERNALMODULEDEPENDENCIES
-    Microsoft.Graph.Authentication, Microsoft.Graph.Identity.DirectoryManagement
-
-.REQUIREDSCRIPTS
-
-.EXTERNALSCRIPTDEPENDENCIES
-
-.RELEASENOTES
-    v4.0 - Added browser-based UI via embedded HTTP listener. Authentication now
-           happens before the listener starts to avoid thread-blocking issues.
-           Ctrl+C handled cleanly via async BeginGetContext polling.
-    v3.0 - Implemented -DisableDevice and -RemoveDevice actions. Added pagination
-           via Get-GraphPagedResults. Added WhatIf/Confirm support. Moved to
-           Graph API v1.0. Fixed DeviceId vs ObjectId for mutations.
-    v2.0 - Added -DisabledDevices scope, -ExportToCSV, and Graph session reuse.
-    v1.0 - Initial release.
-#>
-
 <#
 .SYNOPSIS
     Identifies and manages stale or disabled devices in Microsoft Entra ID via
@@ -119,11 +76,22 @@
     before JSON serialisation to avoid the legacy /Date(...)/ format emitted by
     ConvertTo-Json in Windows PowerShell 5.1 when serialising [datetime] objects.
 
-.LINK
-    https://kasperjohansen.net
+.VERSION
+    4.0
 
-.LINK
-    https://learn.microsoft.com/en-us/graph/api/resources/device
+.AUTHOR
+    Kasper Johansen
+
+.RELEASENOTES
+    v4.0 - Added browser-based UI via embedded HTTP listener. Authentication now
+           happens before the listener starts to avoid thread-blocking issues.
+           Ctrl+C handled cleanly via async BeginGetContext polling.
+    v3.0 - Implemented -DisableDevice and -RemoveDevice actions. Added pagination
+           via Get-GraphPagedResults. Added WhatIf/Confirm support. Moved to
+           Graph API v1.0. Fixed DeviceId vs ObjectId for mutations.
+    v2.0 - Added -DisabledDevices scope, -ExportToCSV, and Graph session reuse.
+    v1.0 - Initial release.
+    
 #>
 
 #Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Identity.DirectoryManagement
