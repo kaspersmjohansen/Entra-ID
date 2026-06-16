@@ -1,5 +1,39 @@
 <#PSScriptInfo
+.VERSION
+    4.1
 
+.EXTERNALMODULEDEPENDENCIES
+    Microsoft.Graph.Authentication, Microsoft.Graph.Identity.DirectoryManagement
+
+.RELEASENOTES
+    v4.1 - Fixed pendingAction being nulled by closeConfirm() before executeAction()
+           could read it, causing "Starting null on N device(s)" and "Unknown action"
+           errors when removing or disabling devices from the UI.
+           Fixed raw Unicode characters (tick, cross, em-dash) being mangled in the
+           HTTP response by replacing them with HTML entities (&#10003;, &#10007;,
+           &mdash;) which are ASCII-safe regardless of encoding.
+           Fixed Ctrl+C not stopping the listener by replacing the blocking
+           GetContext() call with async BeginGetContext() polled every 500 ms.
+           Fixed double login prompt by moving Connect-MgGraph before the HTTP
+           listener starts so the auth flow cannot block the listener thread.
+           Fixed last sign-in and registered dates not displaying by casting Graph
+           datetime values to ISO 8601 strings before ConvertTo-Json serialisation,
+           avoiding the legacy /Date(...)/ format emitted by PowerShell 5.1.
+           Fixed null-coalescing operator (??) on line 45 replaced with PS 5.1
+           compatible if/else for Retry-After handling.
+           Changed Connected status banner to show the tenant primary domain name
+           instead of the tenant GUID, resolved via GET /v1.0/organization.
+    v4.0 - Added browser-based UI via embedded HTTP listener. Authentication now
+           happens before the listener starts to avoid thread-blocking issues.
+           Ctrl+C handled cleanly via async BeginGetContext polling.
+    v3.0 - Implemented -DisableDevice and -RemoveDevice actions. Added pagination
+           via Get-GraphPagedResults. Added WhatIf/Confirm support. Moved to
+           Graph API v1.0. Fixed DeviceId vs ObjectId for mutations.
+    v2.0 - Added -DisabledDevices scope, -ExportToCSV, and Graph session reuse.
+    v1.0 - Initial release.
+#>
+
+<#
 .SYNOPSIS
     Identifies and manages stale or disabled devices in Microsoft Entra ID via
     a browser-based UI backed by a local Microsoft Graph API HTTP listener.
@@ -64,6 +98,9 @@
     # 5. Select all, click Remove selected, confirm.
 
 .NOTES
+    Version : 4.1
+    Author  : Kasper Johansen | KMJ-Consulting
+
     Requires PowerShell 5.1 or later.
     Requires the following Microsoft Graph PowerShell SDK modules:
       - Microsoft.Graph.Authentication
@@ -72,26 +109,26 @@
     The Graph connection uses Device.ReadWrite.All. If an existing session already
     has this scope for the target tenant it is reused without prompting again.
 
-    Date values (last sign-in, registered) are normalised to ISO 8601 UTC strings
-    before JSON serialisation to avoid the legacy /Date(...)/ format emitted by
+    The HTTP listener uses BeginGetContext() polled at 500 ms intervals rather than
+    the blocking GetContext(), so Ctrl+C in the PowerShell window stops the script
+    cleanly within half a second.
+
+    Date values (last sign-in, registered) are cast to ISO 8601 UTC strings before
+    JSON serialisation to avoid the legacy /Date(...)/ format emitted by
     ConvertTo-Json in Windows PowerShell 5.1 when serialising [datetime] objects.
 
-.VERSION
-    4.0
+    The connected tenant banner resolves the primary domain via
+    GET /v1.0/organization?$select=verifiedDomains and falls back to the tenant
+    GUID if no default domain is found.
 
-.AUTHOR
-    Kasper Johansen
+    All Unicode characters in the embedded HTML are expressed as HTML entities to
+    ensure correct rendering regardless of HTTP response encoding.
 
-.RELEASENOTES
-    v4.0 - Added browser-based UI via embedded HTTP listener. Authentication now
-           happens before the listener starts to avoid thread-blocking issues.
-           Ctrl+C handled cleanly via async BeginGetContext polling.
-    v3.0 - Implemented -DisableDevice and -RemoveDevice actions. Added pagination
-           via Get-GraphPagedResults. Added WhatIf/Confirm support. Moved to
-           Graph API v1.0. Fixed DeviceId vs ObjectId for mutations.
-    v2.0 - Added -DisabledDevices scope, -ExportToCSV, and Graph session reuse.
-    v1.0 - Initial release.
+.LINK
+    https://kasperjohansen.net
 
+.LINK
+    https://learn.microsoft.com/en-us/graph/api/resources/device
 #>
 
 #Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Identity.DirectoryManagement
@@ -459,7 +496,7 @@ async function checkStatus() {
     }
   } catch (e) {
     document.getElementById('statusSpinner').style.display = 'none';
-    document.getElementById('statusMsg').textContent = 'Not connected — restart the script.';
+    document.getElementById('statusMsg').innerHTML = 'Not connected &mdash; restart the script.';
     document.getElementById('statusMsg').style.color = 'var(--danger)';
   }
 }
@@ -511,8 +548,8 @@ function renderTable(devs) {
     const registered = parseDate(d.registered);
     const daysSince  = lastSignIn ? Math.floor((Date.now() - lastSignIn.getTime()) / 86400000) : null;
     const ageClass   = daysSince === null ? '' : daysSince > 180 ? 'stale-age' : daysSince > 90 ? 'old-age' : '';
-    const ageStr     = daysSince === null ? '—' : `<span class="${ageClass}">${daysSince}d ago</span>`;
-    const regStr     = registered ? registered.toLocaleDateString() : '—';
+    const ageStr     = daysSince === null ? '&mdash;' : `<span class="${ageClass}">${daysSince}d ago</span>`;
+    const regStr     = registered ? registered.toLocaleDateString() : '&mdash;';
     const statusBadge = d.accountEnabled
       ? '<span class="badge-enabled">Enabled</span>'
       : '<span class="badge-disabled">Disabled</span>';
@@ -520,9 +557,9 @@ function renderTable(devs) {
     return `<tr id="row-${i}">
       <td class="td-check"><input type="checkbox" data-idx="${i}" onchange="onRowCheck(${i},this.checked)" /></td>
       <td style="font-weight:500">${esc(d.displayName)}</td>
-      <td>${esc(d.operatingSystem||'—')}</td>
-      <td style="color:var(--text2)">${esc(d.operatingSystemVersion||'—')}</td>
-      <td>${jt[d.trustType]||esc(d.trustType)||'—'}</td>
+      <td>${esc(d.operatingSystem||'&mdash;')}</td>
+      <td style="color:var(--text2)">${esc(d.operatingSystemVersion||'&mdash;')}</td>
+      <td>${jt[d.trustType]||esc(d.trustType)||'&mdash;'}</td>
       <td>${ageStr}</td>
       <td style="color:var(--text2)">${regStr}</td>
       <td>${statusBadge}</td>
@@ -593,12 +630,13 @@ function closeConfirm() {
 }
 
 async function executeAction() {
+  const action = pendingAction;
   closeConfirm();
   const sel     = getSelected();
   const targets = sel.map(i => devices[i]);
   const logList = document.getElementById('logList');
   logList.style.display = 'flex';
-  logList.innerHTML = `<div class="log-item log-info">Starting ${pendingAction} on ${targets.length} device(s)...</div>`;
+  logList.innerHTML = `<div class="log-item log-info">Starting ${action} on ${targets.length} device(s)...</div>`;
 
   document.getElementById('disableBtn').disabled = true;
   document.getElementById('removeBtn').disabled  = true;
@@ -608,14 +646,15 @@ async function executeAction() {
       const r = await fetch('/action', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: pendingAction, objectId: dev.objectId, displayName: dev.displayName })
+        body: JSON.stringify({ action: action, objectId: dev.objectId, displayName: dev.displayName })
       });
       const d = await r.json();
       const item = document.createElement('div');
       item.className = 'log-item ' + (d.ok ? 'log-ok' : 'log-err');
       item.textContent = d.ok
-        ? `✓ ${dev.displayName}`
-        : `✗ ${dev.displayName} — ${d.error}`;
+        ? '&#10003; ' + dev.displayName
+        : '&#10007; ' + dev.displayName + ' &mdash; ' + d.error;
+      item.innerHTML = item.textContent;
       logList.appendChild(item);
       logList.scrollTop = logList.scrollHeight;
       if (d.ok) {
@@ -626,7 +665,7 @@ async function executeAction() {
     } catch (e) {
       const item = document.createElement('div');
       item.className = 'log-item log-err';
-      item.textContent = `✗ ${dev.displayName} — ${e.message}`;
+      item.innerHTML = '&#10007; ' + dev.displayName + ' &mdash; ' + e.message;
       logList.appendChild(item);
     }
   }
