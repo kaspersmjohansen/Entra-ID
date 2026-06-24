@@ -1,6 +1,6 @@
 <#PSScriptInfo
 .VERSION
-    4.2
+    4.5
 
 .GUID
     e3b2f1a7-4c8d-4e9f-b1d2-7a6c5e8f3b2d
@@ -32,6 +32,26 @@
 .EXTERNALSCRIPTDEPENDENCIES
 
 .RELEASENOTES
+    v4.5 - Added signed-in user name, UPN and assigned directory roles to the
+           connection status card. The /me call is expanded to include displayName
+           and userPrincipalName. Role displayNames are fetched alongside roleTemplateIds
+           in the transitiveMemberOf call and passed through /status as the roles array.
+           Roles that grant write access are shown with an accent-coloured pill;
+           read-only roles use the default muted pill style.
+    v4.4 - Fixed permission indicator showing Read/Write for Global Reader accounts.
+           The previous check used OAuth scopes (Device.ReadWrite.All) which are
+           granted at the app consent level and do not reflect the signed-in user's
+           Entra directory role. Replaced with a GET /v1.0/me/transitiveMemberOf
+           role check against the known roleTemplateIds for Cloud Device Admin,
+           Intune Admin, Windows 365 Admin, Global Admin, and Privileged Role Admin.
+           Updated tooltips to reference the Entra directory role rather than scopes.
+    v4.3 - Added permission indicator to the connection status banner. After auth,
+           the actual granted scopes are checked via Get-MgContext. If
+           Device.ReadWrite.All was not granted (consent denied or insufficient
+           Entra role), a Read-only amber pill is shown and the Disable and Remove
+           buttons are disabled with a tooltip explaining why. A Read/Write green
+           pill is shown when write access is confirmed. The readOnly flag is
+           passed from the PS listener to the browser via the /status endpoint.
     v4.2 - Added Last check-in date column to the results table showing the
            absolute locale date of the last sign-in alongside the existing
            relative age column. Also added to the CSV export as LastSignInDate.
@@ -324,6 +344,9 @@ input[type=range]{flex:1;height:4px;cursor:pointer;accent-color:var(--accent)}
 .connect-pill{font-size:11px;padding:3px 9px;border-radius:20px;font-weight:500;white-space:nowrap}
 .pill-ok{background:var(--success-bg);color:var(--success)}
 .pill-no{background:var(--danger-bg);color:var(--danger)}
+.pill-readonly{background:var(--warn-bg);color:var(--warn)}
+.role-pill{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg2);color:var(--text2);border:.5px solid var(--border);white-space:nowrap}
+.role-pill.write{background:var(--accent-bg);color:var(--accent);border-color:var(--accent)}
 
 /* results area */
 .results-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px}
@@ -379,10 +402,18 @@ input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;cursor:po
 
   <!-- Connection status -->
   <div class="card" id="statusCard">
-    <div style="display:flex;align-items:center;gap:10px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <div class="spinner" id="statusSpinner" style="display:block"></div>
       <span id="statusMsg" style="font-size:13px;color:var(--text2)">Checking connection...</span>
       <span id="connectPill" class="connect-pill" style="display:none"></span>
+      <span id="permPill" class="connect-pill" style="display:none"></span>
+    </div>
+    <div id="userRow" style="display:none;margin-top:8px">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:4px">
+        <span id="userNameSpan" style="font-weight:500;color:var(--text)"></span>
+        <span id="upnSpan" style="margin-left:5px;color:var(--text3)"></span>
+      </div>
+      <div id="rolesRow" style="display:flex;flex-wrap:wrap;gap:4px"></div>
     </div>
   </div>
 
@@ -510,11 +541,15 @@ function setQueryStatus(msg, spinning) {
   document.getElementById('querySpinner').style.display = spinning ? 'block' : 'none';
 }
 
+let isReadOnly = true;
+
 async function checkStatus() {
   try {
     const r = await fetch('/status');
     const d = await r.json();
     if (d.ok) {
+      // Store read-only flag globally so updateSelectionUI can gate the action buttons
+      isReadOnly = d.readOnly;
       document.getElementById('statusSpinner').style.display = 'none';
       document.getElementById('statusMsg').textContent = 'Connected to tenant ' + d.tenant;
       document.getElementById('statusMsg').style.color = 'var(--success)';
@@ -522,7 +557,42 @@ async function checkStatus() {
       pill.textContent = 'Connected';
       pill.className = 'connect-pill pill-ok';
       pill.style.display = '';
+      // Permission indicator - warns the user if write operations are unavailable
+      const perm = document.getElementById('permPill');
+      perm.textContent = isReadOnly ? 'Read-only' : 'Read/Write';
+      perm.className   = 'connect-pill ' + (isReadOnly ? 'pill-readonly' : 'pill-ok');
+      perm.title       = isReadOnly
+        ? 'Your Entra directory role does not include device write permissions. Disable and Remove actions are unavailable.'
+        : 'Your Entra directory role includes device write permissions. All actions available.';
+      perm.style.display = '';
+      // Render signed-in user name, UPN and assigned directory roles
+      document.getElementById('userNameSpan').textContent = d.userName || '';
+      document.getElementById('upnSpan').textContent = d.upn ? '(' + d.upn + ')' : '';
+      const rolesRow = document.getElementById('rolesRow');
+      rolesRow.innerHTML = '';
+      (d.roles || []).forEach(role => {
+        const span = document.createElement('span');
+        span.className = 'role-pill' + (!isReadOnly ? ' write' : '');
+        span.textContent = role;
+        rolesRow.appendChild(span);
+      });
+      if (!d.roles || d.roles.length === 0) {
+        const span = document.createElement('span');
+        span.className = 'role-pill';
+        span.textContent = 'No directory roles assigned';
+        rolesRow.appendChild(span);
+      }
+      document.getElementById('userRow').style.display = '';
       document.getElementById('queryBtn').disabled = false;
+      // Disable action buttons immediately if read-only; re-evaluated on each selection change
+      if (isReadOnly) {
+        const disableBtn = document.getElementById('disableBtn');
+        const removeBtn  = document.getElementById('removeBtn');
+        disableBtn.disabled = true;
+        disableBtn.title    = 'Unavailable: your Entra directory role does not include device write permissions.';
+        removeBtn.disabled  = true;
+        removeBtn.title     = 'Unavailable: your Entra directory role does not include device write permissions.';
+      }
     }
   } catch (e) {
     document.getElementById('statusSpinner').style.display = 'none';
@@ -638,8 +708,9 @@ function updateSelectionUI() {
   const sb  = document.getElementById('selBadge');
   sb.textContent = `${n} selected`;
   sb.style.display = n ? '' : 'none';
-  document.getElementById('disableBtn').disabled = n === 0;
-  document.getElementById('removeBtn').disabled  = n === 0;
+  // Only enable action buttons when there is a selection AND the session has write permissions
+  document.getElementById('disableBtn').disabled = n === 0 || isReadOnly;
+  document.getElementById('removeBtn').disabled  = n === 0 || isReadOnly;
 }
 
 function confirmAction(action) {
@@ -740,6 +811,7 @@ Write-Host "A browser window will open for authentication." -ForegroundColor Gra
 
 $ConnectedTenantId = $null
 $ConnectedDomain   = $null
+$ReadOnly          = $true
 try {
     $ExistingCtx = Get-MgContext
     if ($ExistingCtx -and ($ExistingCtx.Scopes -contains "Device.ReadWrite.All")) {
@@ -751,6 +823,38 @@ try {
         $ConnectedTenantId = (Get-MgContext).TenantId
         Write-Host "Connected to tenant $ConnectedTenantId." -ForegroundColor Green
     }
+    # Determine write permission by checking the signed-in user's transitive directory
+    # role assignments rather than the OAuth scope. Device.ReadWrite.All is a delegated
+    # scope granted to the app - it does not reflect the user's Entra role. A Global
+    # Reader will be granted the scope but cannot write; the role check is authoritative.
+    #
+    # Roles that include device write permissions (displayName -> roleDefinitionId):
+    #   Cloud Device Administrator  : 7698a772-787b-4ac8-901f-60d6b08affd2
+    #   Intune Administrator        : 3a2c62db-5318-420d-8d74-23affee5d9d5
+    #   Windows 365 Administrator   : 11451d60-acb2-45eb-a7d6-43d0f0125c13
+    #   Global Administrator        : 62e90394-69f5-4237-9190-012177145e10
+    #   Privileged Role Administrator: e8611ab8-c189-46e8-94e1-60213ab1f814
+    $DeviceWriteRoleIds = @(
+        "7698a772-787b-4ac8-901f-60d6b08affd2",  # Cloud Device Administrator
+        "3a2c62db-5318-420d-8d74-23affee5d9d5",  # Intune Administrator
+        "11451d60-acb2-45eb-a7d6-43d0f0125c13",  # Windows 365 Administrator
+        "62e90394-69f5-4237-9190-012177145e10",  # Global Administrator
+        "e8611ab8-c189-46e8-94e1-60213ab1f814"   # Privileged Role Administrator
+    )
+    $Me = Invoke-MgGraphRequest -Method Get -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,displayName,userPrincipalName" -ErrorAction Stop
+    $ConnectedUserName = $Me.displayName
+    $ConnectedUPN      = $Me.userPrincipalName
+    $RoleResponse = Invoke-MgGraphRequest -Method Get `
+        -Uri "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.directoryRole?`$select=displayName,roleTemplateId" `
+        -ErrorAction Stop
+    $AssignedRoles           = $RoleResponse.value
+    $AssignedRoleTemplateIds = $AssignedRoles | ForEach-Object { $_.roleTemplateId }
+    $AssignedRoleNames       = $AssignedRoles | ForEach-Object { $_.displayName } | Sort-Object
+    $ReadOnly = -not ($AssignedRoleTemplateIds | Where-Object { $DeviceWriteRoleIds -contains $_ })
+    $PermissionLabel = if ($ReadOnly) { "Read-only" } else { "Read/Write" }
+    Write-Host "Signed in as: $ConnectedUserName ($ConnectedUPN)" -ForegroundColor Green
+    Write-Host "Roles: $($AssignedRoleNames -join ', ')" -ForegroundColor Green
+    Write-Host "Permission level: $PermissionLabel" -ForegroundColor $(if ($ReadOnly) { "Yellow" } else { "Green" })
     # Resolve primary domain from the organization object
     $OrgResponse = Invoke-MgGraphRequest -Method Get -Uri "https://graph.microsoft.com/v1.0/organization?`$select=verifiedDomains" -ErrorAction Stop
     $ConnectedDomain = ($OrgResponse.value[0].verifiedDomains | Where-Object { $_.isDefault -eq $true }).name
@@ -787,7 +891,7 @@ function Invoke-RequestHandler {
     switch ($path) {
 
         "/status" {
-            Write-JsonResponse -Context $ctx -Body @{ ok = $true; tenant = $ConnectedDomain }
+            Write-JsonResponse -Context $ctx -Body @{ ok = $true; tenant = $ConnectedDomain; readOnly = $ReadOnly; userName = $ConnectedUserName; upn = $ConnectedUPN; roles = $AssignedRoleNames }
         }
 
         "/query" {
