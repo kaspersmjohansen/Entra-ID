@@ -1,11 +1,40 @@
 <#PSScriptInfo
 .VERSION
-    4.1
+    4.2
+
+.GUID
+    e3b2f1a7-4c8d-4e9f-b1d2-7a6c5e8f3b2d
+
+.AUTHOR
+    Kasper Johansen
+
+.COMPANYNAME
+    KMJ-Consulting
+
+.COPYRIGHT
+    (c) Kasper Johansen. All rights reserved.
+
+.TAGS
+    Intune, EntraID, AzureAD, GraphAPI, DeviceManagement, StaleDevices, MDM, MEM
+
+.LICENSEURI
+
+.PROJECTURI
+    https://kasperjohansen.net
+
+.ICONURI
 
 .EXTERNALMODULEDEPENDENCIES
     Microsoft.Graph.Authentication, Microsoft.Graph.Identity.DirectoryManagement
 
+.REQUIREDSCRIPTS
+
+.EXTERNALSCRIPTDEPENDENCIES
+
 .RELEASENOTES
+    v4.2 - Added Last check-in date column to the results table showing the
+           absolute locale date of the last sign-in alongside the existing
+           relative age column. Also added to the CSV export as LastSignInDate.
     v4.1 - Fixed pendingAction being nulled by closeConfirm() before executeAction()
            could read it, causing "Starting null on N device(s)" and "Unknown action"
            errors when removing or disabling devices from the UI.
@@ -437,6 +466,7 @@ input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;cursor:po
             <th>Version</th>
             <th>Join type</th>
             <th>Last sign-in</th>
+            <th>Last check-in date</th>
             <th>Registered</th>
             <th>Status</th>
           </tr>
@@ -548,8 +578,11 @@ function renderTable(devs) {
     const registered = parseDate(d.registered);
     const daysSince  = lastSignIn ? Math.floor((Date.now() - lastSignIn.getTime()) / 86400000) : null;
     const ageClass   = daysSince === null ? '' : daysSince > 180 ? 'stale-age' : daysSince > 90 ? 'old-age' : '';
-    const ageStr     = daysSince === null ? '&mdash;' : `<span class="${ageClass}">${daysSince}d ago</span>`;
-    const regStr     = registered ? registered.toLocaleDateString() : '&mdash;';
+    // ageStr  = relative age e.g. "92d ago", colour-coded by threshold
+    // lastSignInDate = absolute locale date shown in the adjacent "Last check-in date" column
+    const ageStr          = daysSince === null ? '&mdash;' : `<span class="${ageClass}">${daysSince}d ago</span>`;
+    const lastSignInDate  = lastSignIn ? lastSignIn.toLocaleDateString() : '&mdash;';
+    const regStr          = registered ? registered.toLocaleDateString() : '&mdash;';
     const statusBadge = d.accountEnabled
       ? '<span class="badge-enabled">Enabled</span>'
       : '<span class="badge-disabled">Disabled</span>';
@@ -561,6 +594,7 @@ function renderTable(devs) {
       <td style="color:var(--text2)">${esc(d.operatingSystemVersion||'&mdash;')}</td>
       <td>${jt[d.trustType]||esc(d.trustType)||'&mdash;'}</td>
       <td>${ageStr}</td>
+      <td style="color:var(--text2)">${lastSignInDate}</td>
       <td style="color:var(--text2)">${regStr}</td>
       <td>${statusBadge}</td>
     </tr>`;
@@ -679,10 +713,10 @@ async function executeAction() {
 
 function exportCSV() {
   if (!devices.length) return;
-  const headers = ['DisplayName','DeviceId','OS','Version','JoinType','LastSignIn','Registered','AccountEnabled'];
+  const headers = ['DisplayName','DeviceId','OS','Version','JoinType','LastSignIn','LastSignInDate','Registered','AccountEnabled'];
   const rows = devices.map(d => [
     d.displayName, d.deviceId, d.operatingSystem, d.operatingSystemVersion,
-    d.trustType, d.lastSignIn||'', d.registered||'', d.accountEnabled
+    d.trustType, d.lastSignIn||'', (parseDate(d.lastSignIn) ? parseDate(d.lastSignIn).toLocaleDateString() : ''), d.registered||'', d.accountEnabled
   ].map(v => `"${String(v||'').replace(/"/g,'""')}"`).join(','));
   const csv  = [headers.join(','), ...rows].join('\r\n');
   const blob = new Blob([csv], { type: 'text/csv' });
