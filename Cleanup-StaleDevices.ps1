@@ -10,7 +10,7 @@
 
 .RELEASENOTES
     v4.6 - Connection and startup fixes:
-           - Default port changed from 8734 to 80; UI opens at http://localhost/.
+           - Listener uses a custom port (default 8734, range 1024-65535).
              A clear error is shown if the port is in use (use -Port to change).
            - Fixed false "Not connected" for accounts with a single directory
              role (roles was sent as a string instead of an array).
@@ -103,20 +103,20 @@
     Press Ctrl+C in the PowerShell window to stop the listener and exit.
 
 .PARAMETER Port
-    TCP port for the local HTTP listener. Default is 80 (standard HTTP).
-    Change this if port 80 is already in use on the machine, e.g. by IIS.
+    TCP port for the local HTTP listener (1024-65535). Default is 8734.
+    Change this if the default port is already in use on the machine.
 
 .EXAMPLE
     .\Cleanup-StaleDevices.ps1
 
     Connects to Microsoft Graph (browser auth prompt), then opens the UI at
-    http://localhost/. Use the UI to set filters and query devices.
+    http://localhost:8734/. Use the UI to set filters and query devices.
 
 .EXAMPLE
-    .\Cleanup-StaleDevices.ps1 -Port 8734
+    .\Cleanup-StaleDevices.ps1 -Port 9000
 
-    Starts the listener on port 8734 instead of the default 80. Useful if
-    another process (such as IIS) is already bound to port 80.
+    Starts the listener on port 9000 instead of the default 8734. Useful if
+    another process is already bound to 8734.
 
 .EXAMPLE
     # Typical stale device cleanup workflow:
@@ -173,7 +173,8 @@
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = "High")]
 param(
-    [Int32]$Port = 80
+    [ValidateRange(1024, 65535)]
+    [Int32]$Port = 8734
 )
 
 # ── module bootstrap ─────────────────────────────────────────────────────────
@@ -1042,16 +1043,15 @@ function Invoke-RequestHandler {
 # prefixes, and it answers on both IPv4 (127.0.0.1) and IPv6 (::1) loopback.
 # An IP-literal prefix such as http://127.0.0.1/ requires elevation or a
 # netsh URL ACL reservation, so it is deliberately not used.
-$BaseUrl  = if ($Port -eq 80) { "http://localhost/" } else { "http://localhost:$Port/" }
-$Prefix   = "http://localhost:$Port/"
+$BaseUrl  = "http://localhost:$Port/"
 $Listener = [System.Net.HttpListener]::new()
-$Listener.Prefixes.Add($Prefix)
+$Listener.Prefixes.Add($BaseUrl)
 try {
     $Listener.Start()
 }
 catch {
     Write-Error ("Could not start the HTTP listener on port $Port`: $($_.Exception.Message)`n" +
-        "Port $Port may be in use by another service (e.g. IIS, Skype, a local web server). " +
+        "Port $Port may be in use by another process. " +
         "Check with: netstat -ano | findstr :$Port  - or run the script with -Port <another port>.")
     exit 1
 }
