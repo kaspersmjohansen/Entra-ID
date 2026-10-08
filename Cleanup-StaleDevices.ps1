@@ -20,6 +20,8 @@
              OPTIONS preflight handler).
            - Missing Microsoft Graph modules are installed automatically
              (CurrentUser scope); #Requires -Modules removed.
+           - Fixed Export CSV button doing nothing (parseDate was out of scope).
+             CSV is now UTF-8 with BOM for Excel and keeps AccountEnabled=false.
     v4.5 - Added signed-in user name, UPN and assigned directory roles to the
            connection status card. The /me call is expanded to include displayName
            and userPrincipalName. Role displayNames are fetched alongside roleTemplateIds
@@ -561,6 +563,13 @@ input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;cursor:po
 let devices = [];
 let pendingAction = null;
 
+// Shared by renderTable() and exportCSV() - returns a Date or null for empty/invalid values
+function parseDate(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 function syncAge(val, fromNum) {
   const n = Math.max(1, Math.min(5475, parseInt(val) || 1));
   document.getElementById('ageSlider').value = Math.min(n, 365);
@@ -713,7 +722,6 @@ function renderTable(devs) {
     return;
   }
   tbody.innerHTML = devs.map((d, i) => {
-    const parseDate = v => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d; };
     const lastSignIn = parseDate(d.lastSignIn);
     const registered = parseDate(d.registered);
     const daysSince  = lastSignIn ? Math.floor((Date.now() - lastSignIn.getTime()) / 86400000) : null;
@@ -859,13 +867,19 @@ function exportCSV() {
   const rows = devices.map(d => [
     d.displayName, d.deviceId, d.operatingSystem, d.operatingSystemVersion,
     d.trustType, d.lastSignIn||'', (parseDate(d.lastSignIn) ? parseDate(d.lastSignIn).toLocaleDateString() : ''), d.registered||'', d.accountEnabled
-  ].map(v => `"${String(v||'').replace(/"/g,'""')}"`).join(','));
-  const csv  = [headers.join(','), ...rows].join('\r\n');
-  const blob = new Blob([csv], { type: 'text/csv' });
+  // ?? keeps false (AccountEnabled) instead of turning it into an empty string
+  ].map(v => `"${String(v ?? '').replace(/"/g,'""')}"`).join(','));
+  // UTF-8 BOM so Excel opens Danish characters (æ, ø, å) in device names correctly
+  const csv  = '﻿' + [headers.join(','), ...rows].join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement('a');
   a.href = url; a.download = `StaleDevices_${new Date().toISOString().slice(0,10)}.csv`;
-  a.click(); URL.revokeObjectURL(url);
+  // Anchor must be in the DOM for some browsers, and revoking the URL immediately
+  // can cancel the download before it starts - so clean up after a short delay
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
 }
 </script>
 </body>
@@ -988,7 +1002,8 @@ function Invoke-RequestHandler {
                 if ($Body.scope -eq "disabled") { $Params.DisabledDevices = $true }
                 else { $Params.Age = [int]$Body.age }
                 $Result = Get-StaleDevices @Params
-                Write-JsonResponse -Context $ctx -Body @{ ok = $true; devices = @($Result) }
+                # Filter nulls - @($null) is a one-element array and would send [null] to the browser
+                Write-JsonResponse -Context $ctx -Body @{ ok = $true; devices = @($Result | Where-Object { $_ }) }
             }
             catch {
                 Write-JsonResponse -Context $ctx -Body @{ ok = $false; error = $_.Exception.Message }
