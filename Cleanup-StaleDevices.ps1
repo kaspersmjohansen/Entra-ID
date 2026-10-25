@@ -165,6 +165,9 @@
     ensure correct rendering regardless of HTTP response encoding.
 
 .LINK
+    https://github.com/kaspersmjohansen/Entra-ID
+
+.LINK
     https://kasperjohansen.net
 
 .LINK
