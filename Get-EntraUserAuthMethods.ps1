@@ -9,6 +9,15 @@
     disabled in the tenant Authentication Methods policy are reported as non-usable. Registered
     methods whose policy configuration is not returned by Graph are reported as '<method> (unknown)'.
     Results can be exported to CSV and to an interactive HTML report with client side filtering.
+    Each user is also classified as phishing-resistant MFA registered or not, based only on the
+    registered methods (passkeys/FIDO2, Windows Hello for Business, Platform Credential for macOS and
+    certificate-based authentication). Synced passkeys are accepted, but device-bound passkeys
+    (FIDO2 security keys, passkeys in Microsoft Authenticator) are recommended for admins.
+    Certificate-based authentication (CBA) only counts as phishing-resistant MFA when it is
+    configured as multifactor; the CBA binding is not evaluated by this script. Users not found in the users lookup get account status
+    'Unknown'. The HTML summary cards count active members only (enabled accounts with user type
+    member); guests, disabled accounts and accounts with unknown status are shown in the table but
+    excluded from the cards. Use -ExcludeGuests and -ExcludeDisabled to leave them out of the report.
     Only read-only Graph calls (GET) are used.
     An existing Microsoft Graph session is only reused if it belongs to the requested tenant and has
     the required scopes; otherwise the script connects again. The connected tenant name and id are
@@ -24,18 +33,41 @@
     (e.g. contoso.onmicrosoft.com). If an existing Graph session belongs to another tenant, the
     script connects to this tenant instead. A domain name is compared against the verified domains
     of the connected tenant.
+.PARAMETER ExcludeGuests
+    Leaves guest users (userType guest, e.g. B2B guests) out of the report rows, CSV, HTML and output.
+    Default off: guests are included in the rows but never counted in the HTML summary cards.
+.PARAMETER ExcludeDisabled
+    Leaves disabled accounts (accountEnabled false) out of the report rows, CSV, HTML and output.
+    Accounts with unknown status (not found in the users lookup) are kept. Default off: disabled
+    accounts are included in the rows but never counted in the HTML summary cards.
 .EXAMPLE
     .\Get-EntraUserAuthMethods.ps1 -OutputPath C:\Reports\AuthMethods.csv
 .EXAMPLE
     .\Get-EntraUserAuthMethods.ps1 -HtmlPath C:\Reports\AuthMethods.html
+.EXAMPLE
+    .\Get-EntraUserAuthMethods.ps1 -HtmlPath C:\Reports\AuthMethods.html -ExcludeGuests -ExcludeDisabled
 .NOTES
     Kasper Johansen | Apento
     kmj@apento.com
 
-    Version: 1.5.3
+    Version: 1.5.4
     Updated: 2026-11-23
 
     Changelog
+    1.5.4 - 2026-11-23
+        Report accuracy: users not found in the users lookup (accountEnabled null) are shown as
+        account status 'Unknown' instead of 'Disabled', with their own status filter option and a new
+        AccountStatus column. Added IsPhishingResistantRegistered (derived only from methodsRegistered)
+        and MFA capable / phishing-resistant columns and filters to the HTML report. HTML summary cards
+        now count active members only (enabled members, no guests, disabled or unknown status) and
+        show the totals per group; new cards for MFA capable, phishing-resistant MFA and admins
+        without phishing-resistant MFA, with notes that device-bound passkeys are recommended for
+        admins and that CBA must be configured as multifactor. Added -ExcludeGuests and
+        -ExcludeDisabled switches. System Preferred Method is now read from the documented
+        systemPreferredAuthenticationMethods collection (joined with '; ') instead of the
+        non-existent singular property, so the column is populated. An empty report (e.g. all rows
+        removed by the switches) no longer crashes: the HTML report renders with zero rows and a
+        'No users' message, and the CSV is written with the header row only.
     1.5.3 - 2026-11-23
         Tenant and scope check: an existing Graph session is only reused if it belongs to -TenantId
         (tenant ID or verified domain name) and has the required scopes, otherwise Connect-MgGraph
@@ -93,12 +125,24 @@ param(
     [string]$HtmlPath,
 
     [Parameter()]
-    [string]$TenantId
+    [string]$TenantId,
+
+    [Parameter()]
+    [switch]$ExcludeGuests,
+
+    [Parameter()]
+    [switch]$ExcludeDisabled
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '1.5.3'
+$ScriptVersion = '1.5.4'
 $RequiredScopes = @('AuditLog.Read.All', 'User.Read.All', 'Policy.Read.All')
+# Report columns in CSV order. Used to write the CSV header when the report has no rows.
+$ReportColumns = @('UserPrincipalName', 'DisplayName', 'UserType', 'AccountEnabled', 'AccountStatus', 'IsAdmin',
+    'IsMfaRegistered', 'IsMfaCapable', 'IsPhishingResistantRegistered', 'IsSsprRegistered', 'IsSsprEnabled',
+    'IsPasswordlessCapable', 'MethodsRegistered', 'NonUsableMethods', 'PreferredAuthMethod',
+    'SystemPreferredMethod', 'LastUpdated')
+$PhishingResistantNote = 'Phishing-resistant MFA is based on the registered methods only: passkeys (device-bound and synced), FIDO2 security keys, Windows Hello for Business, Platform Credential for macOS and certificate-based authentication. Device-bound passkeys (FIDO2 security keys, passkeys in Microsoft Authenticator) are recommended for admins. Certificate-based authentication (CBA) only counts as phishing-resistant MFA when it is configured as multifactor.'
 $SensitiveReportWarning = 'contains sensitive information about user authentication methods (e.g. which admins have no MFA registered). Store it in a secure location with restricted access and delete it when it is no longer needed.'
 
 function Get-MgGraphAllPages {
@@ -189,6 +233,81 @@ function Get-NonUsableMethods {
     }
 
     return ($nonUsable -join '; ')
+}
+
+function Test-PhishingResistantRegistered {
+    # Returns $true if at least one registered method (userRegistrationDetails.methodsRegistered)
+    # is phishing-resistant. Derived only from the registered methods; the Authentication Methods
+    # policy, passkey profiles and Conditional Access authentication strengths are not evaluated.
+    #
+    # Counted as phishing-resistant:
+    #   fido2, fido2SecurityKey, passKeyDeviceBound, passKeyDeviceBoundAuthenticator,
+    #   passKeyDeviceBoundWindowsHello - device-bound passkeys / FIDO2 security keys.
+    #   passKeySynced - synced passkeys (e.g. iCloud Keychain, Google Password Manager). Microsoft
+    #     documents passkeys, including synced passkeys, as phishing-resistant. They do not support
+    #     attestation, so organisations requiring device-bound keys for admins should check the
+    #     MethodsRegistered column.
+    #   windowsHelloForBusiness, macOsSecureEnclaveKey (Platform Credential for macOS).
+    #   x509Certificate - certificate-based authentication. Only phishing-resistant MFA when the
+    #     CBA authentication binding is multifactor; single-factor binding is not evaluated here.
+    # Not counted: phone, email, Microsoft Authenticator push/passwordless, OATH, TAP, QR code and
+    # security questions. Unknown future method names are not counted.
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [array]$RegisteredMethods
+    )
+
+    $phishingResistantMethods = @(
+        'fido2'
+        'fido2SecurityKey'
+        'passKeyDeviceBound'
+        'passKeyDeviceBoundAuthenticator'
+        'passKeyDeviceBoundWindowsHello'
+        'passKeySynced'
+        'windowsHelloForBusiness'
+        'macOsSecureEnclaveKey'
+        'x509Certificate'
+    )
+
+    foreach ($method in $RegisteredMethods) {
+        if ($phishingResistantMethods -contains [string]$method) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-AccountStatus {
+    # Converts accountEnabled to Enabled / Disabled / Unknown. $null (user not found in the users
+    # lookup) is Unknown, not Disabled.
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$AccountEnabled
+    )
+
+    if ($AccountEnabled -is [bool]) {
+        if ($AccountEnabled) { return 'Enabled' }
+        return 'Disabled'
+    }
+    if ($null -ne $AccountEnabled) {
+        $text = ([string]$AccountEnabled).Trim()
+        if ($text -eq 'true') { return 'Enabled' }
+        if ($text -eq 'false') { return 'Disabled' }
+    }
+    return 'Unknown'
+}
+
+function Test-ActiveMember {
+    # Active member = enabled account (accountEnabled true) with user type member.
+    # Guests, disabled accounts and accounts with unknown status are not active members.
+    param(
+        [Parameter(Mandatory)]
+        [object]$User
+    )
+
+    return ((Get-AccountStatus -AccountEnabled $User.AccountEnabled) -eq 'Enabled') -and ([string]$User.UserType -eq 'member')
 }
 
 function Get-MissingGraphScope {
@@ -390,6 +509,7 @@ function ConvertTo-HtmlSafe {
 function New-AuthMethodsHtmlReport {
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [array]$Report,
 
         [Parameter()]
@@ -400,10 +520,25 @@ function New-AuthMethodsHtmlReport {
     )
 
     $generatedOn = Get-Date -Format "yyyy-MM-dd HH:mm"
-    $totalUsers = $Report.Count
-    $mfaRegisteredCount = ($Report | Where-Object { $_.IsMfaRegistered }).Count
-    $ssprRegisteredCount = ($Report | Where-Object { $_.IsSsprRegistered }).Count
-    $passwordlessCount = ($Report | Where-Object { $_.IsPasswordlessCapable }).Count
+    # Totals for all rows in the report.
+    $totalUsers = @($Report).Count
+    $guestTotal = @($Report | Where-Object { [string]$_.UserType -eq 'guest' }).Count
+    $disabledTotal = @($Report | Where-Object { (Get-AccountStatus -AccountEnabled $_.AccountEnabled) -eq 'Disabled' }).Count
+    $unknownStatusTotal = @($Report | Where-Object { (Get-AccountStatus -AccountEnabled $_.AccountEnabled) -eq 'Unknown' }).Count
+
+    # Summary cards count active members only: enabled accounts with user type member. Guests
+    # register their methods in their home tenant and disabled accounts cannot sign in, so
+    # including them would inflate the number of users without MFA.
+    $activeMembers = @($Report | Where-Object { Test-ActiveMember -User $_ })
+    $activeMemberCount = $activeMembers.Count
+    $mfaRegisteredCount = @($activeMembers | Where-Object { $_.IsMfaRegistered }).Count
+    $mfaCapableCount = @($activeMembers | Where-Object { $_.IsMfaCapable }).Count
+    $ssprRegisteredCount = @($activeMembers | Where-Object { $_.IsSsprRegistered }).Count
+    $passwordlessCount = @($activeMembers | Where-Object { $_.IsPasswordlessCapable }).Count
+    $phishingResistantCount = @($activeMembers | Where-Object { $_.IsPhishingResistantRegistered }).Count
+    $activeAdmins = @($activeMembers | Where-Object { $_.IsAdmin })
+    $activeAdminCount = $activeAdmins.Count
+    $adminsWithoutPhishingResistantCount = @($activeAdmins | Where-Object { -not $_.IsPhishingResistantRegistered }).Count
 
     $userTypes = $Report | Select-Object -ExpandProperty UserType -Unique | Sort-Object
     $preferredMethods = $Report | Select-Object -ExpandProperty PreferredAuthMethod -Unique | Sort-Object
@@ -422,19 +557,23 @@ function New-AuthMethodsHtmlReport {
         $mfaClass = if ($user.IsMfaRegistered) { "yes" } else { "no" }
         $ssprClass = if ($user.IsSsprRegistered) { "yes" } else { "no" }
         $adminClass = if ($user.IsAdmin) { "yes" } else { "no" }
-        $statusClass = if ($user.AccountEnabled) { "yes" } else { "no" }
-        $statusText = if ($user.AccountEnabled) { "Enabled" } else { "Disabled" }
+        $statusText = Get-AccountStatus -AccountEnabled $user.AccountEnabled
+        $statusClass = switch ($statusText) { 'Enabled' { 'yes' } 'Disabled' { 'no' } default { 'unknown' } }
+        $mfaCapableClass = if ($user.IsMfaCapable) { "yes" } else { "no" }
+        $phishingResistantClass = if ($user.IsPhishingResistantRegistered) { "yes" } else { "no" }
         $nonUsableClass = if ($user.NonUsableMethods) { "no" } else { "" }
         $passwordlessClass = if ($user.IsPasswordlessCapable) { "yes" } else { "no" }
 
         @"
-        <tr data-usertype="$(ConvertTo-HtmlSafe $user.UserType)" data-admin="$(ConvertTo-HtmlSafe $user.IsAdmin)" data-status="$(ConvertTo-HtmlSafe $user.AccountEnabled)" data-mfa="$(ConvertTo-HtmlSafe $user.IsMfaRegistered)" data-sspr="$(ConvertTo-HtmlSafe $user.IsSsprRegistered)" data-preferred="$(ConvertTo-HtmlSafe $user.PreferredAuthMethod)" data-methods="$(ConvertTo-HtmlSafe ([string]$user.MethodsRegistered).ToLower())" data-nonusable="$(ConvertTo-HtmlSafe ([string]$user.NonUsableMethods).ToLower())">
+        <tr data-usertype="$(ConvertTo-HtmlSafe $user.UserType)" data-admin="$(ConvertTo-HtmlSafe $user.IsAdmin)" data-status="$(ConvertTo-HtmlSafe $statusText)" data-mfa="$(ConvertTo-HtmlSafe $user.IsMfaRegistered)" data-mfacapable="$(ConvertTo-HtmlSafe $user.IsMfaCapable)" data-phishres="$(ConvertTo-HtmlSafe $user.IsPhishingResistantRegistered)" data-sspr="$(ConvertTo-HtmlSafe $user.IsSsprRegistered)" data-preferred="$(ConvertTo-HtmlSafe $user.PreferredAuthMethod)" data-methods="$(ConvertTo-HtmlSafe ([string]$user.MethodsRegistered).ToLower())" data-nonusable="$(ConvertTo-HtmlSafe ([string]$user.NonUsableMethods).ToLower())">
             <td>$(ConvertTo-HtmlSafe $user.DisplayName)</td>
             <td>$(ConvertTo-HtmlSafe $user.UserPrincipalName)</td>
             <td>$(ConvertTo-HtmlSafe $user.UserType)</td>
             <td class="$adminClass">$(ConvertTo-HtmlSafe $user.IsAdmin)</td>
             <td class="$statusClass">$statusText</td>
             <td class="$mfaClass">$(ConvertTo-HtmlSafe $user.IsMfaRegistered)</td>
+            <td class="$mfaCapableClass">$(ConvertTo-HtmlSafe $user.IsMfaCapable)</td>
+            <td class="$phishingResistantClass">$(ConvertTo-HtmlSafe $user.IsPhishingResistantRegistered)</td>
             <td class="$ssprClass">$(ConvertTo-HtmlSafe $user.IsSsprRegistered)</td>
             <td class="$passwordlessClass">$(ConvertTo-HtmlSafe $user.IsPasswordlessCapable)</td>
             <td>$(ConvertTo-HtmlSafe $user.MethodsRegistered)</td>
@@ -445,7 +584,11 @@ function New-AuthMethodsHtmlReport {
         </tr>
 "@
     }
-    $rowsHtml = $rows -join "`n"
+    $rowsHtml = @($rows) -join "`n"
+    $noUsersHtml = ''
+    if ($totalUsers -eq 0) {
+        $noUsersHtml = '<div class="empty" id="noUsers" role="status">No users in this report. No users were returned, or all users were left out by -ExcludeGuests / -ExcludeDisabled.</div>'
+    }
 
     $html = @"
 <!DOCTYPE html>
@@ -473,6 +616,11 @@ function New-AuthMethodsHtmlReport {
     tr:nth-child(even) { background: #fafbfc; }
     td.yes { color: var(--yes); font-weight: 600; }
     td.no { color: var(--no); font-weight: 600; }
+    td.unknown { color: #6b7280; font-style: italic; }
+    .card.warn .num { color: var(--no); }
+    .method-note { color: #6b7280; font-size: 12px; margin: -12px 0 20px 0; }
+    .empty { background: #fff; border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 14px; color: #6b7280; font-size: 14px; }
+    .summary-note { color: #6b7280; font-size: 12px; margin: -12px 0 20px 0; }
     .table-wrap { max-height: 70vh; overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
     #rowCount { font-size: 12px; color: #6b7280; margin: 8px 0; }
 </style>
@@ -483,12 +631,18 @@ function New-AuthMethodsHtmlReport {
 <div class="meta">Tenant $(ConvertTo-HtmlSafe $TenantDisplayName) ($(ConvertTo-HtmlSafe $TenantIdValue)) | Generated $generatedOn | Script version $ScriptVersion</div>
 <div class="notice" id="sensitiveNotice" role="note"><strong>Sensitive report:</strong> this report contains sensitive information about user authentication methods, e.g. which admins have no MFA registered. Store it in a secure location with restricted access, do not share it unencrypted and delete it when it is no longer needed.</div>
 
-<div class="summary">
-    <div class="card"><div class="num">$totalUsers</div><div class="label">Total users</div></div>
-    <div class="card"><div class="num">$mfaRegisteredCount</div><div class="label">MFA registered</div></div>
-    <div class="card"><div class="num">$ssprRegisteredCount</div><div class="label">SSPR registered</div></div>
-    <div class="card"><div class="num">$passwordlessCount</div><div class="label">Passwordless capable</div></div>
+<div class="summary" id="summaryCards">
+    <div class="card"><div class="num" id="cardActiveMembers">$activeMemberCount</div><div class="label">Active members</div></div>
+    <div class="card"><div class="num" id="cardMfaRegistered">$mfaRegisteredCount</div><div class="label">MFA registered</div></div>
+    <div class="card"><div class="num" id="cardMfaCapable">$mfaCapableCount</div><div class="label">MFA capable</div></div>
+    <div class="card" title="$(ConvertTo-HtmlSafe $PhishingResistantNote)"><div class="num" id="cardPhishingResistant">$phishingResistantCount</div><div class="label">Phishing-resistant MFA registered</div></div>
+    <div class="card"><div class="num" id="cardSsprRegistered">$ssprRegisteredCount</div><div class="label">SSPR registered</div></div>
+    <div class="card"><div class="num" id="cardPasswordless">$passwordlessCount</div><div class="label">Passwordless capable</div></div>
+    <div class="card"><div class="num" id="cardActiveAdmins">$activeAdminCount</div><div class="label">Admins</div></div>
+    <div class="card warn" title="$(ConvertTo-HtmlSafe $PhishingResistantNote)"><div class="num" id="cardAdminsNoPhishingResistant">$adminsWithoutPhishingResistantCount</div><div class="label">Admins without phishing-resistant MFA</div></div>
 </div>
+<div class="summary-note" id="summaryNote">Summary cards count active members only (enabled accounts with user type member). Guests, disabled accounts and accounts with unknown status are shown in the table but not counted in the cards. All users in report: <span id="totalUsers">$totalUsers</span> | Guests: <span id="totalGuests">$guestTotal</span> | Disabled: <span id="totalDisabled">$disabledTotal</span> | Unknown status: <span id="totalUnknownStatus">$unknownStatusTotal</span></div>
+<div class="method-note" id="phishingResistantNote">$(ConvertTo-HtmlSafe $PhishingResistantNote)</div>
 
 <div class="filters">
     <div>
@@ -505,11 +659,19 @@ function New-AuthMethodsHtmlReport {
     </div>
     <div>
         <label for="statusFilter">Account status</label>
-        <select id="statusFilter"><option value="">All</option><option value="True">Enabled</option><option value="False">Disabled</option></select>
+        <select id="statusFilter"><option value="">All</option><option value="Enabled">Enabled</option><option value="Disabled">Disabled</option><option value="Unknown">Unknown</option></select>
     </div>
     <div>
         <label for="mfaFilter">MFA registered</label>
         <select id="mfaFilter"><option value="">All</option><option value="True">Yes</option><option value="False">No</option></select>
+    </div>
+    <div>
+        <label for="mfaCapableFilter">MFA capable</label>
+        <select id="mfaCapableFilter"><option value="">All</option><option value="True">Yes</option><option value="False">No</option></select>
+    </div>
+    <div>
+        <label for="phishResFilter">Phishing-resistant MFA</label>
+        <select id="phishResFilter"><option value="">All</option><option value="True">Yes</option><option value="False">No</option></select>
     </div>
     <div>
         <label for="ssprFilter">SSPR registered</label>
@@ -535,6 +697,7 @@ function New-AuthMethodsHtmlReport {
 </div>
 
 <div id="rowCount"></div>
+$noUsersHtml
 
 <div class="table-wrap">
 <table id="reportTable">
@@ -546,6 +709,8 @@ function New-AuthMethodsHtmlReport {
             <th>Admin</th>
             <th>Account Status</th>
             <th>MFA Registered</th>
+            <th>MFA Capable</th>
+            <th title="$(ConvertTo-HtmlSafe $PhishingResistantNote)">Phishing-resistant MFA</th>
             <th>SSPR Registered</th>
             <th>Passwordless Capable</th>
             <th>Methods Registered</th>
@@ -567,6 +732,8 @@ $rowsHtml
     var adminFilter = document.getElementById('adminFilter');
     var statusFilter = document.getElementById('statusFilter');
     var mfaFilter = document.getElementById('mfaFilter');
+    var mfaCapableFilter = document.getElementById('mfaCapableFilter');
+    var phishResFilter = document.getElementById('phishResFilter');
     var ssprFilter = document.getElementById('ssprFilter');
     var preferredFilter = document.getElementById('preferredFilter');
     var methodsFilter = document.getElementById('methodsFilter');
@@ -580,6 +747,8 @@ $rowsHtml
         var admin = adminFilter.value;
         var status = statusFilter.value;
         var mfa = mfaFilter.value;
+        var mfaCapable = mfaCapableFilter.value;
+        var phishRes = phishResFilter.value;
         var sspr = ssprFilter.value;
         var preferred = preferredFilter.value;
         var methods = methodsFilter.value.toLowerCase();
@@ -595,6 +764,8 @@ $rowsHtml
             if (admin && row.dataset.admin !== admin) { matches = false; }
             if (status && row.dataset.status !== status) { matches = false; }
             if (mfa && row.dataset.mfa !== mfa) { matches = false; }
+            if (mfaCapable && row.dataset.mfacapable !== mfaCapable) { matches = false; }
+            if (phishRes && row.dataset.phishres !== phishRes) { matches = false; }
             if (sspr && row.dataset.sspr !== sspr) { matches = false; }
             if (preferred && row.dataset.preferred !== preferred) { matches = false; }
             if (methods && row.dataset.methods.indexOf(methods) === -1) { matches = false; }
@@ -612,7 +783,7 @@ $rowsHtml
         rowCount.textContent = visible + " of " + rows.length + " users shown";
     }
 
-    [searchBox, userTypeFilter, adminFilter, statusFilter, mfaFilter, ssprFilter, preferredFilter, methodsFilter, nonUsableFilter].forEach(function (el) {
+    [searchBox, userTypeFilter, adminFilter, statusFilter, mfaFilter, mfaCapableFilter, phishResFilter, ssprFilter, preferredFilter, methodsFilter, nonUsableFilter].forEach(function (el) {
         el.addEventListener('input', applyFilters);
         el.addEventListener('change', applyFilters);
     });
@@ -676,23 +847,46 @@ try {
             DisplayName           = $user.userDisplayName
             UserType              = $user.userType
             AccountEnabled        = $accountEnabled
+            AccountStatus         = Get-AccountStatus -AccountEnabled $accountEnabled
             IsAdmin               = $user.isAdmin
             IsMfaRegistered       = $user.isMfaRegistered
             IsMfaCapable          = $user.isMfaCapable
+            IsPhishingResistantRegistered = Test-PhishingResistantRegistered -RegisteredMethods $user.methodsRegistered
             IsSsprRegistered      = $user.isSsprRegistered
             IsSsprEnabled         = $user.isSsprEnabled
             IsPasswordlessCapable = $user.isPasswordlessCapable
             MethodsRegistered     = ($user.methodsRegistered -join '; ')
             NonUsableMethods      = Get-NonUsableMethods -RegisteredMethods $user.methodsRegistered -PolicyState $policyState
             PreferredAuthMethod   = $user.userPreferredMethodForSecondaryAuthentication
-            SystemPreferredMethod = $user.systemPreferredAuthenticationMethod
+            SystemPreferredMethod = (@($user.systemPreferredAuthenticationMethods) -join '; ')
             LastUpdated           = $user.lastUpdatedDateTime
         }
+    }
+    $report = @($report)
+
+    # Optional row filters (default off, all users are included).
+    if ($ExcludeGuests) {
+        $guestCount = @($report | Where-Object { [string]$_.UserType -eq 'guest' }).Count
+        $report = @($report | Where-Object { [string]$_.UserType -ne 'guest' })
+        Write-Verbose "ExcludeGuests: $guestCount guest user(s) left out of the report"
+    }
+    if ($ExcludeDisabled) {
+        $disabledCount = @($report | Where-Object { $_.AccountStatus -eq 'Disabled' }).Count
+        $report = @($report | Where-Object { $_.AccountStatus -ne 'Disabled' })
+        Write-Verbose "ExcludeDisabled: $disabledCount disabled account(s) left out of the report"
     }
 
     if ($OutputPath) {
         if ($PSCmdlet.ShouldProcess($OutputPath, "Export authentication method report as CSV")) {
-            $report | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+            if ($report.Count -gt 0) {
+                $report | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+            }
+            else {
+                # Export-Csv writes nothing for an empty report; write the header row only.
+                $csvHeader = ($ReportColumns | ForEach-Object { '"' + $_ + '"' }) -join ','
+                Set-Content -Path $OutputPath -Value $csvHeader -Encoding UTF8
+                Write-Warning "The report contains no users. The CSV report $OutputPath contains the header row only."
+            }
             Write-Host "CSV report exported to $OutputPath"
             Write-Warning "The CSV report $OutputPath $SensitiveReportWarning"
         }
@@ -703,6 +897,9 @@ try {
             $htmlContent = New-AuthMethodsHtmlReport -Report $report -TenantDisplayName $tenant.DisplayName -TenantIdValue $tenant.Id
             Set-Content -Path $HtmlPath -Value $htmlContent -Encoding UTF8
             Write-Host "HTML report exported to $HtmlPath"
+            if ($report.Count -eq 0) {
+                Write-Warning "The report contains no users. The HTML report $HtmlPath has no rows."
+            }
             Write-Warning "The HTML report $HtmlPath $SensitiveReportWarning"
         }
     }
