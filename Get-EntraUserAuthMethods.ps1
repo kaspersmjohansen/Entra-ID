@@ -57,6 +57,14 @@
       Microsoft Graph PowerShell app, so -UseWAM changes nothing (an informational note is shown).
     - Older than 2.0.0 (no Set-MgGraphOption -EnableLoginByWAM): the script stops with an error
       before signing in. Update with Update-Module Microsoft.Graph.Authentication.
+    On Windows a warning recommending Update-Module Microsoft.Graph.Authentication is always shown
+    (with or without -UseWAM) when the module used is older than 2.34.0.
+    If several versions of Microsoft.Graph.Authentication are installed, an older version may be
+    loaded, e.g. because another Microsoft.Graph module already loaded it in the session. Check
+    the loaded version with Get-Module Microsoft.Graph.Authentication and the installed versions
+    with Get-Module Microsoft.Graph.Authentication -ListAvailable; start a new PowerShell session
+    (or Import-Module Microsoft.Graph.Authentication -RequiredVersion <version>) to load the
+    newest version, and remove old versions with Uninstall-Module if needed.
     WAM is only available on Windows; on other platforms -UseWAM is ignored with a warning. If an
     existing session is reused or the session is app-only, no sign-in happens and -UseWAM has no
     effect (verbose note).
@@ -84,7 +92,10 @@
         tenant/scope check reconnect) and the previous persisted value is restored when the script
         ends. With 2.34.0 and later WAM is already the default on Windows and nothing is changed.
         Ignored with a warning on non-Windows; stops with an error if the module is too old; no
-        effect when an existing or app-only session is reused.
+        effect when an existing or app-only session is reused. On Windows a warning recommending
+        Update-Module Microsoft.Graph.Authentication (2.34.0 or later: WAM by default, passkey /
+        FIDO2 sign-in) is always shown when an older module version is used, with or without
+        -UseWAM. Help explains how to check the loaded and installed module versions.
     1.5.4 - 2026-11-23
         Report accuracy: users not found in the users lookup (accountEnabled null) are shown as
         account status 'Unknown' instead of 'Disabled', with their own status filter option and a new
@@ -423,6 +434,39 @@ function Test-WindowsPlatform {
     return ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
 }
 
+function Get-GraphAuthModuleVersion {
+    # Version of the Microsoft.Graph.Authentication module that provides Connect-MgGraph (the
+    # loaded module, or the one PowerShell would auto-load). $null if it is not found.
+    [CmdletBinding()]
+    [OutputType([version])]
+    param()
+
+    $connectCommand = Get-Command -Name Connect-MgGraph -ErrorAction SilentlyContinue
+    if ($connectCommand -and $connectCommand.Module) {
+        return [version]$connectCommand.Module.Version
+    }
+    return $null
+}
+
+function Write-GraphModuleUpdateWarning {
+    # On Windows, warns when Microsoft.Graph.Authentication is older than 2.34.0, where sign-in by
+    # the Web Account Manager (WAM) is not the default and passkey / FIDO2 sign-in may fail.
+    # Shown with or without -UseWAM. Returns $true if the warning was shown.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if (-not (Test-WindowsPlatform)) {
+        return $false
+    }
+    $moduleVersion = Get-GraphAuthModuleVersion
+    if ($moduleVersion -and $moduleVersion -lt [version]'2.34.0') {
+        Write-Warning "Microsoft.Graph.Authentication $moduleVersion is used. Update to 2.34.0 or later with Update-Module Microsoft.Graph.Authentication: from 2.34.0 sign-in uses the Web Account Manager (WAM) by default on Windows, which supports passkey / FIDO2 sign-in. If a newer version is installed, an older one may still be loaded; check with Get-Module Microsoft.Graph.Authentication (loaded) and Get-Module Microsoft.Graph.Authentication -ListAvailable (installed), or start a new PowerShell session."
+        return $true
+    }
+    return $false
+}
+
 function Enable-AuthMethodsWam {
     # Enables sign-in with the Windows Web Account Manager (WAM) before Connect-MgGraph.
     # Set-MgGraphOption persists the option per user, so the previous value is stored in
@@ -438,11 +482,7 @@ function Enable-AuthMethodsWam {
         return 'NotWindows'
     }
 
-    $connectCommand = Get-Command -Name Connect-MgGraph -ErrorAction SilentlyContinue
-    $moduleVersion = $null
-    if ($connectCommand -and $connectCommand.Module) {
-        $moduleVersion = $connectCommand.Module.Version
-    }
+    $moduleVersion = Get-GraphAuthModuleVersion
 
     if ($moduleVersion -and $moduleVersion -ge [version]'2.34.0') {
         Write-Information "-UseWAM: Microsoft.Graph.Authentication $moduleVersion already uses the Web Account Manager (WAM) by default on Windows. No setting was changed." -InformationAction Continue
@@ -509,6 +549,8 @@ function Connect-AuthMethodsGraph {
         [Parameter()]
         [switch]$UseWAM
     )
+
+    $null = Write-GraphModuleUpdateWarning
 
     $context = Get-MgContext
     $tenantInfo = $null
