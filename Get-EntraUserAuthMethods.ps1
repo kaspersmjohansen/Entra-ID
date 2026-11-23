@@ -23,10 +23,14 @@
     Kasper Johansen | Apento
     kmj@apento.com
 
-    Version: 1.5.0
-    Updated: 2026-10-08
+    Version: 1.5.1
+    Updated: 2026-11-23
 
     Changelog
+    1.5.1 - 2026-11-23
+        Security fix: all user data in the HTML report (table cells, data-* attributes and filter
+        dropdown options) is now HTML encoded via ConvertTo-HtmlSafe to prevent stored XSS from
+        e.g. malicious display names. Added a Content-Security-Policy meta tag to the HTML report.
     1.5.0 - 2026-10-08
         Non-usable methods filter changed from free text to a dropdown: All, has non-usable methods,
         no non-usable methods, or a specific non-usable method found in the report.
@@ -69,7 +73,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '1.5.0'
+$ScriptVersion = '1.5.1'
 
 function Get-MgGraphAllPages {
     param(
@@ -134,6 +138,25 @@ function Get-NonUsableMethods {
     return ($nonUsable -join '; ')
 }
 
+function ConvertTo-HtmlSafe {
+    # HTML encodes a value so it can be safely inserted into HTML element content and quoted
+    # attribute values. Null returns an empty string.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(ValueFromPipeline)]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    process {
+        if ($null -eq $Value) {
+            return ''
+        }
+        return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+    }
+}
+
 function New-AuthMethodsHtmlReport {
     param(
         [Parameter(Mandatory)]
@@ -149,15 +172,15 @@ function New-AuthMethodsHtmlReport {
     $userTypes = $Report | Select-Object -ExpandProperty UserType -Unique | Sort-Object
     $preferredMethods = $Report | Select-Object -ExpandProperty PreferredAuthMethod -Unique | Sort-Object
 
-    $userTypeOptions = ($userTypes | ForEach-Object { "<option value=`"$_`">$_</option>" }) -join ""
-    $preferredMethodOptions = ($preferredMethods | ForEach-Object { "<option value=`"$_`">$_</option>" }) -join ""
+    $userTypeOptions = ($userTypes | ForEach-Object { $safeValue = ConvertTo-HtmlSafe $_; "<option value=`"$safeValue`">$safeValue</option>" }) -join ""
+    $preferredMethodOptions = ($preferredMethods | ForEach-Object { $safeValue = ConvertTo-HtmlSafe $_; "<option value=`"$safeValue`">$safeValue</option>" }) -join ""
 
     $nonUsableMethodList = $Report |
         Where-Object { $_.NonUsableMethods } |
         ForEach-Object { $_.NonUsableMethods -split '; ' } |
         Select-Object -Unique |
         Sort-Object
-    $nonUsableOptions = ($nonUsableMethodList | ForEach-Object { "<option value=`"$($_.ToLower())`">$_</option>" }) -join ""
+    $nonUsableOptions = ($nonUsableMethodList | ForEach-Object { "<option value=`"$(ConvertTo-HtmlSafe ([string]$_).ToLower())`">$(ConvertTo-HtmlSafe $_)</option>" }) -join ""
 
     $rows = foreach ($user in $Report) {
         $mfaClass = if ($user.IsMfaRegistered) { "yes" } else { "no" }
@@ -169,20 +192,20 @@ function New-AuthMethodsHtmlReport {
         $passwordlessClass = if ($user.IsPasswordlessCapable) { "yes" } else { "no" }
 
         @"
-        <tr data-usertype="$($user.UserType)" data-admin="$($user.IsAdmin)" data-status="$($user.AccountEnabled)" data-mfa="$($user.IsMfaRegistered)" data-sspr="$($user.IsSsprRegistered)" data-preferred="$($user.PreferredAuthMethod)" data-methods="$($user.MethodsRegistered.ToLower())" data-nonusable="$($user.NonUsableMethods.ToLower())">
-            <td>$($user.DisplayName)</td>
-            <td>$($user.UserPrincipalName)</td>
-            <td>$($user.UserType)</td>
-            <td class="$adminClass">$($user.IsAdmin)</td>
+        <tr data-usertype="$(ConvertTo-HtmlSafe $user.UserType)" data-admin="$(ConvertTo-HtmlSafe $user.IsAdmin)" data-status="$(ConvertTo-HtmlSafe $user.AccountEnabled)" data-mfa="$(ConvertTo-HtmlSafe $user.IsMfaRegistered)" data-sspr="$(ConvertTo-HtmlSafe $user.IsSsprRegistered)" data-preferred="$(ConvertTo-HtmlSafe $user.PreferredAuthMethod)" data-methods="$(ConvertTo-HtmlSafe ([string]$user.MethodsRegistered).ToLower())" data-nonusable="$(ConvertTo-HtmlSafe ([string]$user.NonUsableMethods).ToLower())">
+            <td>$(ConvertTo-HtmlSafe $user.DisplayName)</td>
+            <td>$(ConvertTo-HtmlSafe $user.UserPrincipalName)</td>
+            <td>$(ConvertTo-HtmlSafe $user.UserType)</td>
+            <td class="$adminClass">$(ConvertTo-HtmlSafe $user.IsAdmin)</td>
             <td class="$statusClass">$statusText</td>
-            <td class="$mfaClass">$($user.IsMfaRegistered)</td>
-            <td class="$ssprClass">$($user.IsSsprRegistered)</td>
-            <td class="$passwordlessClass">$($user.IsPasswordlessCapable)</td>
-            <td>$($user.MethodsRegistered)</td>
-            <td class="$nonUsableClass">$($user.NonUsableMethods)</td>
-            <td>$($user.PreferredAuthMethod)</td>
-            <td>$($user.SystemPreferredMethod)</td>
-            <td>$($user.LastUpdated)</td>
+            <td class="$mfaClass">$(ConvertTo-HtmlSafe $user.IsMfaRegistered)</td>
+            <td class="$ssprClass">$(ConvertTo-HtmlSafe $user.IsSsprRegistered)</td>
+            <td class="$passwordlessClass">$(ConvertTo-HtmlSafe $user.IsPasswordlessCapable)</td>
+            <td>$(ConvertTo-HtmlSafe $user.MethodsRegistered)</td>
+            <td class="$nonUsableClass">$(ConvertTo-HtmlSafe $user.NonUsableMethods)</td>
+            <td>$(ConvertTo-HtmlSafe $user.PreferredAuthMethod)</td>
+            <td>$(ConvertTo-HtmlSafe $user.SystemPreferredMethod)</td>
+            <td>$(ConvertTo-HtmlSafe $user.LastUpdated)</td>
         </tr>
 "@
     }
@@ -193,6 +216,7 @@ function New-AuthMethodsHtmlReport {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
 <title>Entra Authentication Methods Report</title>
 <style>
     :root { --border: #d9dde3; --head: #1f2937; --yes: #1a7f37; --no: #b42318; }
