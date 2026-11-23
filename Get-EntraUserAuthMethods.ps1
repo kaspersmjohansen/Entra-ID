@@ -6,7 +6,8 @@
     Uses the Microsoft Graph authentication methods registration report to list all users along with
     their registered authentication methods, preferred authentication method, and MFA/SSPR status.
     Account enabled/disabled status is added from the users endpoint, and registered methods that are
-    disabled in the tenant Authentication Methods policy are reported as non-usable.
+    disabled in the tenant Authentication Methods policy are reported as non-usable. Registered
+    methods whose policy configuration is not returned by Graph are reported as '<method> (unknown)'.
     Results can be exported to CSV and to an interactive HTML report with client side filtering.
     Only read-only Graph calls (GET) are used.
 .PARAMETER OutputPath
@@ -23,10 +24,18 @@
     Kasper Johansen | Apento
     kmj@apento.com
 
-    Version: 1.5.1
+    Version: 1.5.2
     Updated: 2026-11-23
 
     Changelog
+    1.5.2 - 2026-11-23
+        NonUsableMethods fix: a registered method whose policy configuration is missing from the
+        policy response is now reported as '<method> (unknown)' instead of non-usable. HardwareOath
+        is not part of the v1.0 policy, so it is read from the beta endpoint as a best-effort
+        fallback (read-only). Method mapping updated: added email, passKeySynced, fido2SecurityKey,
+        qrCode and x509Certificate. alternateMobilePhone now maps to Voice only (SMS is not
+        supported on the alternate phone). windowsHelloForBusiness, macOsSecureEnclaveKey and
+        securityQuestion are not governed by the Authentication Methods policy and are not flagged.
     1.5.1 - 2026-11-23
         Security fix: all user data in the HTML report (table cells, data-* attributes and filter
         dropdown options) is now HTML encoded via ConvertTo-HtmlSafe to prevent stored XSS from
@@ -73,7 +82,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '1.5.1'
+$ScriptVersion = '1.5.2'
 
 function Get-MgGraphAllPages {
     param(
@@ -104,32 +113,59 @@ function Get-NonUsableMethods {
         [hashtable]$PolicyState
     )
 
-    # Maps registered method names to the Authentication Methods policy configuration(s) that govern them.
-    # A method is usable if at least one of its governing configurations is enabled.
+    # Maps registered method names (userRegistrationDetails.methodsRegistered) to the
+    # Authentication Methods policy configuration id(s) (authenticationMethodConfiguration.id)
+    # that govern them. A method is usable if at least one of its governing configurations is
+    # enabled. Only the tenant wide enabled/disabled state is evaluated, not group targeting or
+    # passkey profiles (e.g. whether a profile allows synced passkeys).
+    #
+    # If none of a method's governing configurations is present in the policy state, the state is
+    # unknown and the method is reported as '<method> (unknown)' rather than non-usable. This
+    # happens e.g. for HardwareOath when the beta fallback is unavailable, since the v1.0
+    # authenticationMethodsPolicy does not include the HardwareOath configuration.
+    #
+    # Not governed by the Authentication Methods policy and therefore never flagged:
+    #   windowsHelloForBusiness, macOsSecureEnclaveKey (device / platform credentials) and
+    #   securityQuestion (controlled by the SSPR policy, not the Authentication Methods policy).
+    #   Unknown future method names are also ignored.
     $methodMap = @{
         'mobilePhone'                        = @('Sms', 'Voice')
-        'alternateMobilePhone'               = @('Sms', 'Voice')
+        # SMS is only supported on the primary mobile phone; the alternate phone supports voice only.
+        'alternateMobilePhone'               = @('Voice')
         'officePhone'                        = @('Voice')
+        'email'                              = @('Email')
         'microsoftAuthenticatorPush'         = @('MicrosoftAuthenticator')
         'microsoftAuthenticatorPasswordless' = @('MicrosoftAuthenticator')
         'softwareOneTimePasscode'            = @('SoftwareOath', 'MicrosoftAuthenticator')
         'hardwareOneTimePasscode'            = @('HardwareOath')
         'fido2'                              = @('Fido2')
+        'fido2SecurityKey'                   = @('Fido2')
         'passKeyDeviceBound'                 = @('Fido2')
         'passKeyDeviceBoundAuthenticator'    = @('Fido2')
         'passKeyDeviceBoundWindowsHello'     = @('Fido2')
+        # Synced passkeys are governed by the Passkey (FIDO2) configuration (passkey profiles).
+        'passKeySynced'                      = @('Fido2')
         'temporaryAccessPass'                = @('TemporaryAccessPass')
+        'qrCode'                             = @('QRCodePin')
+        'x509Certificate'                    = @('X509Certificate')
     }
 
     $nonUsable = foreach ($method in $RegisteredMethods) {
         if ($methodMap.ContainsKey($method)) {
             $usable = $false
+            $known = $false
             foreach ($policyId in $methodMap[$method]) {
-                if ($PolicyState[$policyId] -eq 'enabled') {
-                    $usable = $true
+                if ($PolicyState.ContainsKey($policyId)) {
+                    $known = $true
+                    if ($PolicyState[$policyId] -eq 'enabled') {
+                        $usable = $true
+                    }
                 }
             }
-            if (-not $usable) {
+            if (-not $known) {
+                "$method (unknown)"
+            }
+            elseif (-not $usable) {
                 $method
             }
         }
@@ -421,6 +457,21 @@ try {
     $policyState = @{}
     foreach ($methodConfig in $authMethodsPolicy.authenticationMethodConfigurations) {
         $policyState[$methodConfig.id] = $methodConfig.state
+    }
+
+    # The v1.0 policy does not include the HardwareOath configuration. Read it from beta as a
+    # best-effort, read-only fallback. If that fails, hardware OATH tokens are reported as unknown.
+    if (-not $policyState.ContainsKey('HardwareOath')) {
+        try {
+            $hardwareOathUri = 'https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/HardwareOath'
+            $hardwareOathConfig = Invoke-MgGraphRequest -Method GET -Uri $hardwareOathUri
+            if ($hardwareOathConfig.state) {
+                $policyState['HardwareOath'] = $hardwareOathConfig.state
+            }
+        }
+        catch {
+            Write-Verbose "HardwareOath policy state could not be read from beta, reported as unknown: $($_.Exception.Message)"
+        }
     }
 
     $report = foreach ($user in $registrationDetails) {
