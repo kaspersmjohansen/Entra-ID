@@ -22,6 +22,8 @@
     An existing Microsoft Graph session is only reused if it belongs to the requested tenant and has
     the required scopes; otherwise the script connects again. The connected tenant name and id are
     always shown before any data is read.
+    Use -UseWAM to sign in with the Windows Web Account Manager (WAM) broker, e.g. when a passkey /
+    FIDO2 sign-in fails in the Windows PowerShell 5.1 sign-in window.
     The exported reports contain sensitive information (e.g. which admins have no MFA registered).
     Store them in a secure location with restricted access and delete them when no longer needed.
 .PARAMETER OutputPath
@@ -40,20 +42,60 @@
     Leaves disabled accounts (accountEnabled false) out of the report rows, CSV, HTML and output.
     Accounts with unknown status (not found in the users lookup) are kept. Default off: disabled
     accounts are included in the rows but never counted in the HTML summary cards.
+.PARAMETER UseWAM
+    Signs in with the Windows Web Account Manager (WAM) broker instead of the embedded/browser
+    sign-in window. WAM uses the Windows sign-in dialog, which supports passkeys and FIDO2 security
+    keys (including passkeys in Microsoft Authenticator and Windows Hello). Use it when a passkey or
+    FIDO2 sign-in with an admin account does not work in Windows PowerShell 5.1, where the older
+    embedded sign-in window may not support passkeys.
+    Behaviour depends on the installed Microsoft.Graph.Authentication module:
+    - 2.0.0 - 2.33.x: Set-MgGraphOption -EnableLoginByWAM $true is called right before
+      Connect-MgGraph (also when the script reconnects because of the tenant or scope check). This
+      option is persisted per user (~/.mg/mg.graphoptions.json), so the previous value is restored
+      when the script ends.
+    - 2.34.0 and later: WAM is already the default on Windows and is always used with the default
+      Microsoft Graph PowerShell app, so -UseWAM changes nothing (an informational note is shown).
+    - Older than 2.0.0 (no Set-MgGraphOption -EnableLoginByWAM): the script stops with an error
+      before signing in. Update with Update-Module Microsoft.Graph.Authentication.
+    On Windows a warning recommending Update-Module Microsoft.Graph.Authentication is always shown
+    (with or without -UseWAM) when the module used is older than 2.34.0.
+    If several versions of Microsoft.Graph.Authentication are installed, an older version may be
+    loaded, e.g. because another Microsoft.Graph module already loaded it in the session. Check
+    the loaded version with Get-Module Microsoft.Graph.Authentication and the installed versions
+    with Get-Module Microsoft.Graph.Authentication -ListAvailable; start a new PowerShell session
+    (or Import-Module Microsoft.Graph.Authentication -RequiredVersion <version>) to load the
+    newest version, and remove old versions with Uninstall-Module if needed.
+    WAM is only available on Windows; on other platforms -UseWAM is ignored with a warning. If an
+    existing session is reused or the session is app-only, no sign-in happens and -UseWAM has no
+    effect (verbose note).
 .EXAMPLE
     .\Get-EntraUserAuthMethods.ps1 -OutputPath C:\Reports\AuthMethods.csv
 .EXAMPLE
     .\Get-EntraUserAuthMethods.ps1 -HtmlPath C:\Reports\AuthMethods.html
 .EXAMPLE
     .\Get-EntraUserAuthMethods.ps1 -HtmlPath C:\Reports\AuthMethods.html -ExcludeGuests -ExcludeDisabled
+.EXAMPLE
+    .\Get-EntraUserAuthMethods.ps1 -HtmlPath C:\Reports\AuthMethods.html -TenantId contoso.onmicrosoft.com -UseWAM
+    Signs in with the Windows Web Account Manager (e.g. with a passkey) in Windows PowerShell 5.1.
 .NOTES
     Kasper Johansen | Apento
     kmj@apento.com
 
-    Version: 1.5.4
+    Version: 1.5.5
     Updated: 2026-11-23
 
     Changelog
+    1.5.5 - 2026-11-23
+        Added -UseWAM switch: sign in with the Windows Web Account Manager (WAM), e.g. for passkey /
+        FIDO2 sign-in in Windows PowerShell 5.1. With Microsoft.Graph.Authentication 2.0.0 - 2.33.x,
+        Set-MgGraphOption -EnableLoginByWAM $true is set right before Connect-MgGraph (including the
+        tenant/scope check reconnect) and the previous persisted value is restored when the script
+        ends. With 2.34.0 and later WAM is already the default on Windows and nothing is changed.
+        Ignored with a warning on non-Windows; stops with an error if the module is too old; no
+        effect when an existing or app-only session is reused. On Windows a warning recommending
+        Update-Module Microsoft.Graph.Authentication (2.34.0 or later: WAM by default, passkey /
+        FIDO2 sign-in) is always shown when an older module version is used, with or without
+        -UseWAM. Help explains how to check the loaded and installed module versions.
     1.5.4 - 2026-11-23
         Report accuracy: users not found in the users lookup (accountEnabled null) are shown as
         account status 'Unknown' instead of 'Disabled', with their own status filter option and a new
@@ -131,11 +173,17 @@ param(
     [switch]$ExcludeGuests,
 
     [Parameter()]
-    [switch]$ExcludeDisabled
+    [switch]$ExcludeDisabled,
+
+    [Parameter()]
+    [switch]$UseWAM
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '1.5.4'
+$ScriptVersion = '1.5.5'
+# Previous persisted WAM option (Get-MgGraphOption EnableWAMForMSGraph) to restore at the end, set by
+# Enable-AuthMethodsWam when it changes the option.
+$script:WamRestoreValue = $null
 $RequiredScopes = @('AuditLog.Read.All', 'User.Read.All', 'Policy.Read.All')
 # Report columns in CSV order. Used to write the CSV header when the report has no rows.
 $ReportColumns = @('UserPrincipalName', 'DisplayName', 'UserType', 'AccountEnabled', 'AccountStatus', 'IsAdmin',
@@ -378,6 +426,115 @@ function Test-GraphTenantMatch {
     return $null
 }
 
+function Test-WindowsPlatform {
+    # True on Windows (Windows PowerShell 5.1 and PowerShell 7 on Windows).
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+    return ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+}
+
+function Get-GraphAuthModuleVersion {
+    # Version of the Microsoft.Graph.Authentication module that provides Connect-MgGraph (the
+    # loaded module, or the one PowerShell would auto-load). $null if it is not found.
+    [CmdletBinding()]
+    [OutputType([version])]
+    param()
+
+    $connectCommand = Get-Command -Name Connect-MgGraph -ErrorAction SilentlyContinue
+    if ($connectCommand -and $connectCommand.Module) {
+        return [version]$connectCommand.Module.Version
+    }
+    return $null
+}
+
+function Write-GraphModuleUpdateWarning {
+    # On Windows, warns when Microsoft.Graph.Authentication is older than 2.34.0, where sign-in by
+    # the Web Account Manager (WAM) is not the default and passkey / FIDO2 sign-in may fail.
+    # Shown with or without -UseWAM. Returns $true if the warning was shown.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if (-not (Test-WindowsPlatform)) {
+        return $false
+    }
+    $moduleVersion = Get-GraphAuthModuleVersion
+    if ($moduleVersion -and $moduleVersion -lt [version]'2.34.0') {
+        Write-Warning "Microsoft.Graph.Authentication $moduleVersion is used. Update to 2.34.0 or later with Update-Module Microsoft.Graph.Authentication: from 2.34.0 sign-in uses the Web Account Manager (WAM) by default on Windows, which supports passkey / FIDO2 sign-in. If a newer version is installed, an older one may still be loaded; check with Get-Module Microsoft.Graph.Authentication (loaded) and Get-Module Microsoft.Graph.Authentication -ListAvailable (installed), or start a new PowerShell session."
+        return $true
+    }
+    return $false
+}
+
+function Enable-AuthMethodsWam {
+    # Enables sign-in with the Windows Web Account Manager (WAM) before Connect-MgGraph.
+    # Set-MgGraphOption persists the option per user, so the previous value is stored in
+    # $script:WamRestoreValue and restored by Restore-AuthMethodsWam when the script ends.
+    # Returns a short status: NotWindows, Default, AlreadyEnabled or Enabled. Throws if the
+    # Microsoft.Graph.Authentication module is too old.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    if (-not (Test-WindowsPlatform)) {
+        Write-Warning '-UseWAM is ignored: the Web Account Manager (WAM) is only available on Windows. The normal interactive sign-in is used.'
+        return 'NotWindows'
+    }
+
+    $moduleVersion = Get-GraphAuthModuleVersion
+
+    if ($moduleVersion -and $moduleVersion -ge [version]'2.34.0') {
+        Write-Information "-UseWAM: Microsoft.Graph.Authentication $moduleVersion already uses the Web Account Manager (WAM) by default on Windows. No setting was changed." -InformationAction Continue
+        return 'Default'
+    }
+
+    $setOptionCommand = Get-Command -Name Set-MgGraphOption -ErrorAction SilentlyContinue
+    if (-not $setOptionCommand -or -not $setOptionCommand.Parameters.ContainsKey('EnableLoginByWAM')) {
+        $foundVersion = if ($moduleVersion) { [string]$moduleVersion } else { 'not found' }
+        throw "-UseWAM requires Microsoft.Graph.Authentication 2.0.0 or later (Set-MgGraphOption -EnableLoginByWAM), found version $foundVersion. Update the module with Update-Module Microsoft.Graph.Authentication or run the script without -UseWAM. No data has been read."
+    }
+
+    $previousValue = $false
+    $currentOption = Get-MgGraphOption -ErrorAction SilentlyContinue
+    if ($currentOption -and ($currentOption.PSObject.Properties.Name -contains 'EnableWAMForMSGraph')) {
+        $previousValue = [bool]$currentOption.EnableWAMForMSGraph
+    }
+
+    if ($previousValue) {
+        Write-Verbose 'Web Account Manager (WAM) sign-in is already enabled (Get-MgGraphOption).'
+        return 'AlreadyEnabled'
+    }
+
+    Set-MgGraphOption -EnableLoginByWAM $true
+    if ($null -eq $script:WamRestoreValue) {
+        $script:WamRestoreValue = $previousValue
+    }
+    Write-Information 'Web Account Manager (WAM) sign-in enabled for this run. The previous setting is restored when the script ends.' -InformationAction Continue
+    return 'Enabled'
+}
+
+function Restore-AuthMethodsWam {
+    # Restores the persisted WAM option changed by Enable-AuthMethodsWam.
+    [CmdletBinding()]
+    param()
+
+    if ($null -eq $script:WamRestoreValue) {
+        return
+    }
+    $restoreValue = [bool]$script:WamRestoreValue
+    try {
+        Set-MgGraphOption -EnableLoginByWAM $restoreValue
+        Write-Verbose "Web Account Manager (WAM) option restored to EnableLoginByWAM = $restoreValue"
+    }
+    catch {
+        Write-Warning "Could not restore the Web Account Manager (WAM) option. Run Set-MgGraphOption -EnableLoginByWAM `$$restoreValue to restore it: $($_.Exception.Message)"
+    }
+    finally {
+        $script:WamRestoreValue = $null
+    }
+}
+
 function Connect-AuthMethodsGraph {
     # Reuses an existing Graph session only if it belongs to the requested tenant and has the
     # required scopes. Otherwise connects with the required scopes (and -TenantId). Shows and
@@ -387,8 +544,13 @@ function Connect-AuthMethodsGraph {
         [string[]]$RequiredScopes,
 
         [Parameter()]
-        [string]$TenantId
+        [string]$TenantId,
+
+        [Parameter()]
+        [switch]$UseWAM
     )
+
+    $null = Write-GraphModuleUpdateWarning
 
     $context = Get-MgContext
     $tenantInfo = $null
@@ -439,6 +601,11 @@ function Connect-AuthMethodsGraph {
             # Reconnecting only because of missing scopes: stay in the same tenant.
             $connectParams['TenantId'] = $context.TenantId
         }
+        if ($UseWAM) {
+            # Applies to every Connect-MgGraph call in this script, including the reconnect after a
+            # failed tenant or scope check.
+            $null = Enable-AuthMethodsWam
+        }
         Connect-MgGraph @connectParams | Out-Null
 
         $context = Get-MgContext
@@ -454,6 +621,14 @@ function Connect-AuthMethodsGraph {
     }
     else {
         Write-Verbose "Reusing existing Microsoft Graph session for tenant $($context.TenantId)"
+        if ($UseWAM) {
+            if ([string]$context.AuthType -eq 'AppOnly') {
+                Write-Verbose '-UseWAM is ignored: the existing Microsoft Graph session is app-only (no interactive sign-in).'
+            }
+            else {
+                Write-Verbose '-UseWAM has no effect: the existing Microsoft Graph session is reused, no sign-in is needed.'
+            }
+        }
     }
 
     if (-not $tenantInfo) {
@@ -799,7 +974,7 @@ $rowsHtml
 }
 
 try {
-    $tenant = Connect-AuthMethodsGraph -RequiredScopes $RequiredScopes -TenantId $TenantId
+    $tenant = Connect-AuthMethodsGraph -RequiredScopes $RequiredScopes -TenantId $TenantId -UseWAM:$UseWAM
 
     Write-Verbose "Get-EntraUserAuthMethods version $ScriptVersion"
     Write-Verbose "Retrieving user authentication method registration details"
@@ -908,4 +1083,8 @@ try {
 }
 catch {
     Write-Error "Failed to retrieve authentication method report: $($_.Exception.Message)"
+}
+finally {
+    # Restore the persisted WAM option if -UseWAM changed it.
+    Restore-AuthMethodsWam
 }
