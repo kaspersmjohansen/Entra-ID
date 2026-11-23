@@ -30,10 +30,26 @@
     If a required Graph call fails, a clear error is shown and the script ends with a non-zero exit
     code (see Exit codes in the notes); no partial report is written. The registration report
     requires a Microsoft Entra ID P1 or P2 license in the tenant.
+    Progress and status messages are written to the information stream (Write-Information) and are
+    shown by default; hide them with -InformationAction SilentlyContinue. Details are written with
+    Write-Verbose (-Verbose) and warnings with Write-Warning.
+    Timestamps are in UTC and labelled as such: LastUpdated is ISO 8601 UTC (e.g.
+    2026-11-01T10:00:00Z) in the CSV, the HTML report and the output objects. The HTML report shows
+    the generation time in local time with its UTC offset and in UTC.
 .PARAMETER OutputPath
-    Optional path to export the results as CSV. If omitted, no CSV is created.
+    Optional path to export the results as CSV. If omitted, no CSV is created. The CSV is written
+    as UTF-8 with BOM (in Windows PowerShell 5.1 and PowerShell 7), so Excel shows characters
+    such as ae, oe and aa (Danish letters) correctly. To protect against CSV formula injection,
+    text values starting with =, +, -, @, tab or carriage return are prefixed with a single quote
+    (') in the CSV only; the output objects and the HTML report keep the original values.
 .PARAMETER HtmlPath
     Optional path to export the results as an interactive HTML report with client side filtering.
+    Filtering is done in one pass over cached row data, text search is debounced, and only rows
+    whose visibility changes are touched, so the report stays responsive for large tenants
+    (tested with 50,000 rows). At most 1000 matching rows are shown at a time; the 'Show 1000
+    more' and 'Show all' buttons show the rest, and the row counter shows how many users match.
+    Reports with up to 1000 users look and behave as before. Users without a preferred method
+    can be selected with the '(none)' option in the preferred method filter.
 .PARAMETER TenantId
     Optional tenant to connect to, as a tenant ID (GUID) or a verified domain name
     (e.g. contoso.onmicrosoft.com). If an existing Graph session belongs to another tenant, the
@@ -72,6 +88,9 @@
     WAM is only available on Windows; on other platforms -UseWAM is ignored with a warning. If an
     existing session is reused or the session is app-only, no sign-in happens and -UseWAM has no
     effect (verbose note).
+.PARAMETER PassThru
+    Writes the report objects to the pipeline also when -OutputPath or -HtmlPath is used. Without
+    -OutputPath and -HtmlPath the objects are always written to the pipeline (as before).
 .EXAMPLE
     .\Get-EntraUserAuthMethods.ps1 -OutputPath C:\Reports\AuthMethods.csv
 .EXAMPLE
@@ -82,17 +101,47 @@
     .\Get-EntraUserAuthMethods.ps1 -HtmlPath C:\Reports\AuthMethods.html -TenantId contoso.onmicrosoft.com -UseWAM
     Signs in with the Windows Web Account Manager (e.g. with a passkey) in Windows PowerShell 5.1.
 .EXAMPLE
+    $users = .\Get-EntraUserAuthMethods.ps1 -HtmlPath C:\Reports\AuthMethods.html -PassThru
+    Writes the HTML report and also returns the report objects for further processing.
+.EXAMPLE
+    .\Get-EntraUserAuthMethods.ps1 | Where-Object { $_.IsAdmin -and -not $_.IsPhishingResistantRegistered }
+    Without -OutputPath and -HtmlPath the report objects are written to the pipeline.
+.EXAMPLE
     .\Get-EntraUserAuthMethods.ps1 -OutputPath C:\Reports\AuthMethods.csv
     if ($LASTEXITCODE -ne 0) { Write-Warning "Report failed with exit code $LASTEXITCODE" }
     Checks the exit code, e.g. in a scheduled task (powershell.exe -File returns the same code).
+.OUTPUTS
+    PSCustomObject, one per user (see the CSV columns). Written to the pipeline when neither
+    -OutputPath nor -HtmlPath is used, or when -PassThru is used.
 .NOTES
     Kasper Johansen | Apento
     kmj@apento.com
 
-    Version: 1.5.6
+    Version: 1.6.0
     Updated: 2026-11-23
 
     Changelog
+    1.6.0 - 2026-11-23
+        CSV export: written as UTF-8 with BOM in both Windows PowerShell 5.1 and PowerShell 7 (Excel
+        shows Danish letters correctly). CSV formula injection protection: text values starting
+        with =, +, -, @, tab or carriage return are prefixed with a single quote in the CSV only.
+        HTML report: users without a preferred method (empty or 'none') get the filter option
+        '(none)' instead of an empty value that behaved like 'All'. Faster filtering for large
+        tenants: row data is read and cached once, filtering is one pass that only touches rows
+        whose visibility changes (hidden attribute), and text search is debounced. Reports with
+        more than 1000 users show at most 1000 matching rows at a time ('Show 1000 more' / 'Show
+        all' buttons); rows after the first 1000 are hidden when the page loads. The
+        Content-Security-Policy and HTML encoding are unchanged. Report rows are built with a
+        StringBuilder, which makes large reports much faster to generate.
+        Output: Write-Host replaced by Write-Information (shown by default, hide with
+        -InformationAction SilentlyContinue). New -PassThru switch: when -OutputPath or -HtmlPath
+        is used, the report objects are only written to the pipeline with -PassThru; without an
+        export path they are written as before.
+        Time zones: LastUpdated is normalized to ISO 8601 UTC (yyyy-MM-ddTHH:mm:ssZ) in the CSV,
+        HTML and output objects; the HTML column is labelled 'Last Updated (UTC)' and the
+        generation time is shown in local time with UTC offset and in UTC.
+        Internal helper functions renamed to singular nouns / non state-changing verbs
+        (PSScriptAnalyzer): Get-MgGraphAllPage, Get-NonUsableMethod, ConvertTo-AuthMethodsHtml.
     1.5.6 - 2026-11-23
         Least privilege: the Policy.Read.All scope is replaced by Policy.Read.AuthenticationMethod,
         the least privileged permission for reading the Authentication Methods policy (v1.0) and
@@ -218,11 +267,19 @@ param(
     [switch]$ExcludeDisabled,
 
     [Parameter()]
-    [switch]$UseWAM
+    [switch]$UseWAM,
+
+    [Parameter()]
+    [switch]$PassThru
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '1.5.6'
+$ScriptVersion = '1.6.0'
+# Information messages (progress and status) are shown by default. A caller can hide them with
+# -InformationAction SilentlyContinue (or set another $InformationPreference via the parameter).
+if (-not $PSBoundParameters.ContainsKey('InformationAction')) {
+    $InformationPreference = 'Continue'
+}
 # Previous persisted WAM option (Get-MgGraphOption EnableWAMForMSGraph) to restore at the end, set by
 # Enable-AuthMethodsWam when it changes the option.
 $script:WamRestoreValue = $null
@@ -239,9 +296,12 @@ $ReportColumns = @('UserPrincipalName', 'DisplayName', 'UserType', 'AccountEnabl
     'IsPasswordlessCapable', 'MethodsRegistered', 'NonUsableMethods', 'PreferredAuthMethod',
     'SystemPreferredMethod', 'LastUpdated')
 $PhishingResistantNote = 'Phishing-resistant MFA is based on the registered methods only: passkeys (device-bound and synced), FIDO2 security keys, Windows Hello for Business, Platform Credential for macOS and certificate-based authentication. Device-bound passkeys (FIDO2 security keys, passkeys in Microsoft Authenticator) are recommended for admins. Certificate-based authentication (CBA) only counts as phishing-resistant MFA when it is configured as multifactor.'
+# Maximum number of matching rows the HTML report shows at a time ('Show more' / 'Show all' buttons
+# show the rest). Rendering tens of thousands of visible table rows is what makes large reports slow.
+$HtmlPageSize = 1000
 $SensitiveReportWarning = 'contains sensitive information about user authentication methods (e.g. which admins have no MFA registered). Store it in a secure location with restricted access and delete it when it is no longer needed.'
 
-function Get-MgGraphAllPages {
+function Get-MgGraphAllPage {
     param(
         [Parameter(Mandatory)]
         [string]$Uri
@@ -261,7 +321,7 @@ function Get-MgGraphAllPages {
     return $results
 }
 
-function Get-NonUsableMethods {
+function Get-NonUsableMethod {
     param(
         [Parameter()]
         [array]$RegisteredMethods,
@@ -550,7 +610,7 @@ function Enable-AuthMethodsWam {
     $moduleVersion = Get-GraphAuthModuleVersion
 
     if ($moduleVersion -and $moduleVersion -ge [version]'2.34.0') {
-        Write-Information "-UseWAM: Microsoft.Graph.Authentication $moduleVersion already uses the Web Account Manager (WAM) by default on Windows. No setting was changed." -InformationAction Continue
+        Write-Information "-UseWAM: Microsoft.Graph.Authentication $moduleVersion already uses the Web Account Manager (WAM) by default on Windows. No setting was changed."
         return 'Default'
     }
 
@@ -575,7 +635,7 @@ function Enable-AuthMethodsWam {
     if ($null -eq $script:WamRestoreValue) {
         $script:WamRestoreValue = $previousValue
     }
-    Write-Information 'Web Account Manager (WAM) sign-in enabled for this run. The previous setting is restored when the script ends.' -InformationAction Continue
+    Write-Information 'Web Account Manager (WAM) sign-in enabled for this run. The previous setting is restored when the script ends.'
     return 'Enabled'
 }
 
@@ -800,7 +860,7 @@ function Connect-AuthMethodsGraph {
     }
 
     if ($reason) {
-        Write-Information "Connecting to Microsoft Graph: $reason." -InformationAction Continue
+        Write-Information "Connecting to Microsoft Graph: $reason."
         $connectParams = @{
             Scopes = $RequiredScopes
         }
@@ -864,12 +924,120 @@ function Connect-AuthMethodsGraph {
         $tenantIdValue = [string]$context.TenantId
         Write-Warning "The tenant name could not be read from /organization. Verify that tenant $tenantIdValue is the expected tenant."
     }
-    Write-Information "Connected to tenant: $tenantDisplayName ($tenantIdValue) as $($context.Account)" -InformationAction Continue
+    Write-Information "Connected to tenant: $tenantDisplayName ($tenantIdValue) as $($context.Account)"
 
     return [PSCustomObject]@{
         DisplayName = $tenantDisplayName
         Id          = $tenantIdValue
     }
+}
+
+function Test-NoPreferredMethod {
+    # True when a user has no preferred method: empty / null or Graph value 'none'.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [object]$Value
+    )
+
+    $text = ([string]$Value).Trim()
+    return ($text -eq '' -or $text -eq 'none')
+}
+
+function ConvertTo-UtcTimestamp {
+    # Normalizes a timestamp (DateTime, DateTimeOffset or ISO 8601 string from Graph) to ISO 8601
+    # UTC, e.g. 2026-11-01T10:00:00Z. A DateTime without kind is treated as UTC (Graph returns UTC).
+    # Empty values return ''. Values that cannot be parsed are returned unchanged.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value -or [string]$Value -eq '') {
+        return ''
+    }
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Value -is [System.DateTimeOffset]) {
+        $utc = $Value.UtcDateTime
+    }
+    elseif ($Value -is [datetime]) {
+        if ($Value.Kind -eq [System.DateTimeKind]::Unspecified) {
+            $utc = [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc)
+        }
+        else {
+            $utc = $Value.ToUniversalTime()
+        }
+    }
+    else {
+        $parsed = [System.DateTimeOffset]::MinValue
+        $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal
+        if (-not [System.DateTimeOffset]::TryParse([string]$Value, $invariant, $styles, [ref]$parsed)) {
+            return [string]$Value
+        }
+        $utc = $parsed.UtcDateTime
+    }
+    return $utc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $invariant)
+}
+
+function ConvertTo-CsvSafeRow {
+    # Returns a copy of a report row for CSV export where text values starting with =, +, -, @,
+    # tab or carriage return are prefixed with a single quote, so spreadsheet applications do not
+    # evaluate them as formulas (CSV formula injection). Other values are unchanged.
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object]$Row
+    )
+
+    begin {
+        $formulaStart = [char[]]@('=', '+', '-', '@', [char]9, [char]13)
+    }
+    process {
+        $safeRow = [ordered]@{}
+        foreach ($property in $Row.PSObject.Properties) {
+            $value = $property.Value
+            if ($value -is [string] -and $value.Length -gt 0 -and $formulaStart -contains $value[0]) {
+                $value = "'" + $value
+            }
+            $safeRow[$property.Name] = $value
+        }
+        [PSCustomObject]$safeRow
+    }
+}
+
+function Export-AuthMethodsCsv {
+    # Writes the report as CSV, UTF-8 with BOM (same result in Windows PowerShell 5.1 and
+    # PowerShell 7, so Excel detects the encoding), with CSV formula injection protection. An
+    # empty report writes the header row only.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Report,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string[]]$Columns
+    )
+
+    $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    if ($Report.Count -gt 0) {
+        $lines = @($Report | ConvertTo-CsvSafeRow | ConvertTo-Csv -NoTypeInformation)
+    }
+    else {
+        $lines = @(($Columns | ForEach-Object { '"' + $_ + '"' }) -join ',')
+    }
+    $utf8WithBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $true
+    [System.IO.File]::WriteAllLines($fullPath, [string[]]$lines, $utf8WithBom)
 }
 
 function ConvertTo-HtmlSafe {
@@ -891,7 +1059,7 @@ function ConvertTo-HtmlSafe {
     }
 }
 
-function New-AuthMethodsHtmlReport {
+function ConvertTo-AuthMethodsHtml {
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
@@ -904,7 +1072,11 @@ function New-AuthMethodsHtmlReport {
         [string]$TenantIdValue
     )
 
-    $generatedOn = Get-Date -Format "yyyy-MM-dd HH:mm"
+    # Generation time in local time with UTC offset, and in UTC (ISO 8601).
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $now = [System.DateTimeOffset]::Now
+    $generatedOn = $now.ToString("yyyy-MM-dd HH:mm 'UTC'zzz", $invariant)
+    $generatedOnUtc = $now.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $invariant)
     # Totals for all rows in the report.
     $totalUsers = @($Report).Count
     $guestTotal = @($Report | Where-Object { [string]$_.UserType -eq 'guest' }).Count
@@ -926,10 +1098,17 @@ function New-AuthMethodsHtmlReport {
     $adminsWithoutPhishingResistantCount = @($activeAdmins | Where-Object { -not $_.IsPhishingResistantRegistered }).Count
 
     $userTypes = $Report | Select-Object -ExpandProperty UserType -Unique | Sort-Object
-    $preferredMethods = $Report | Select-Object -ExpandProperty PreferredAuthMethod -Unique | Sort-Object
+    # Users without a preferred method (empty or 'none') get the filter value '__none', shown as
+    # '(none)', so they do not get an empty option value that behaves like 'All'.
+    $preferredMethods = @($Report | ForEach-Object { [string]$_.PreferredAuthMethod } |
+        Where-Object { -not (Test-NoPreferredMethod -Value $_) } | Select-Object -Unique | Sort-Object)
+    $hasNoPreferred = @($Report | Where-Object { Test-NoPreferredMethod -Value $_.PreferredAuthMethod }).Count -gt 0
 
     $userTypeOptions = ($userTypes | ForEach-Object { $safeValue = ConvertTo-HtmlSafe $_; "<option value=`"$safeValue`">$safeValue</option>" }) -join ""
     $preferredMethodOptions = ($preferredMethods | ForEach-Object { $safeValue = ConvertTo-HtmlSafe $_; "<option value=`"$safeValue`">$safeValue</option>" }) -join ""
+    if ($hasNoPreferred) {
+        $preferredMethodOptions += '<option value="__none">(none)</option>'
+    }
 
     $nonUsableMethodList = $Report |
         Where-Object { $_.NonUsableMethods } |
@@ -938,38 +1117,64 @@ function New-AuthMethodsHtmlReport {
         Sort-Object
     $nonUsableOptions = ($nonUsableMethodList | ForEach-Object { "<option value=`"$(ConvertTo-HtmlSafe ([string]$_).ToLower())`">$(ConvertTo-HtmlSafe $_)</option>" }) -join ""
 
-    $rows = foreach ($user in $Report) {
-        $mfaClass = if ($user.IsMfaRegistered) { "yes" } else { "no" }
-        $ssprClass = if ($user.IsSsprRegistered) { "yes" } else { "no" }
-        $adminClass = if ($user.IsAdmin) { "yes" } else { "no" }
+    # Rows are built with a StringBuilder and HtmlEncode directly (same encoding as
+    # ConvertTo-HtmlSafe) because per-value function calls are slow for large tenants.
+    $builder = New-Object -TypeName System.Text.StringBuilder -ArgumentList (4096 + 1200 * $totalUsers)
+    $rowIndex = 0
+    foreach ($user in $Report) {
+        $rowIndex++
         $statusText = Get-AccountStatus -AccountEnabled $user.AccountEnabled
         $statusClass = switch ($statusText) { 'Enabled' { 'yes' } 'Disabled' { 'no' } default { 'unknown' } }
-        $mfaCapableClass = if ($user.IsMfaCapable) { "yes" } else { "no" }
-        $phishingResistantClass = if ($user.IsPhishingResistantRegistered) { "yes" } else { "no" }
-        $nonUsableClass = if ($user.NonUsableMethods) { "no" } else { "" }
-        $passwordlessClass = if ($user.IsPasswordlessCapable) { "yes" } else { "no" }
-
-        @"
-        <tr data-usertype="$(ConvertTo-HtmlSafe $user.UserType)" data-admin="$(ConvertTo-HtmlSafe $user.IsAdmin)" data-status="$(ConvertTo-HtmlSafe $statusText)" data-mfa="$(ConvertTo-HtmlSafe $user.IsMfaRegistered)" data-mfacapable="$(ConvertTo-HtmlSafe $user.IsMfaCapable)" data-phishres="$(ConvertTo-HtmlSafe $user.IsPhishingResistantRegistered)" data-sspr="$(ConvertTo-HtmlSafe $user.IsSsprRegistered)" data-preferred="$(ConvertTo-HtmlSafe $user.PreferredAuthMethod)" data-methods="$(ConvertTo-HtmlSafe ([string]$user.MethodsRegistered).ToLower())" data-nonusable="$(ConvertTo-HtmlSafe ([string]$user.NonUsableMethods).ToLower())">
-            <td>$(ConvertTo-HtmlSafe $user.DisplayName)</td>
-            <td>$(ConvertTo-HtmlSafe $user.UserPrincipalName)</td>
-            <td>$(ConvertTo-HtmlSafe $user.UserType)</td>
-            <td class="$adminClass">$(ConvertTo-HtmlSafe $user.IsAdmin)</td>
-            <td class="$statusClass">$statusText</td>
-            <td class="$mfaClass">$(ConvertTo-HtmlSafe $user.IsMfaRegistered)</td>
-            <td class="$mfaCapableClass">$(ConvertTo-HtmlSafe $user.IsMfaCapable)</td>
-            <td class="$phishingResistantClass">$(ConvertTo-HtmlSafe $user.IsPhishingResistantRegistered)</td>
-            <td class="$ssprClass">$(ConvertTo-HtmlSafe $user.IsSsprRegistered)</td>
-            <td class="$passwordlessClass">$(ConvertTo-HtmlSafe $user.IsPasswordlessCapable)</td>
-            <td>$(ConvertTo-HtmlSafe $user.MethodsRegistered)</td>
-            <td class="$nonUsableClass">$(ConvertTo-HtmlSafe $user.NonUsableMethods)</td>
-            <td>$(ConvertTo-HtmlSafe $user.PreferredAuthMethod)</td>
-            <td>$(ConvertTo-HtmlSafe $user.SystemPreferredMethod)</td>
-            <td>$(ConvertTo-HtmlSafe $user.LastUpdated)</td>
-        </tr>
-"@
+        $preferredValue = [string]$user.PreferredAuthMethod
+        if (Test-NoPreferredMethod -Value $preferredValue) {
+            $preferredValue = '__none'
+        }
+        $cells = @(
+            @('', $user.DisplayName),
+            @('', $user.UserPrincipalName),
+            @('', $user.UserType),
+            @($(if ($user.IsAdmin) { 'yes' } else { 'no' }), $user.IsAdmin),
+            @($statusClass, $statusText),
+            @($(if ($user.IsMfaRegistered) { 'yes' } else { 'no' }), $user.IsMfaRegistered),
+            @($(if ($user.IsMfaCapable) { 'yes' } else { 'no' }), $user.IsMfaCapable),
+            @($(if ($user.IsPhishingResistantRegistered) { 'yes' } else { 'no' }), $user.IsPhishingResistantRegistered),
+            @($(if ($user.IsSsprRegistered) { 'yes' } else { 'no' }), $user.IsSsprRegistered),
+            @($(if ($user.IsPasswordlessCapable) { 'yes' } else { 'no' }), $user.IsPasswordlessCapable),
+            @('', $user.MethodsRegistered),
+            @($(if ($user.NonUsableMethods) { 'no' } else { '' }), $user.NonUsableMethods),
+            @('', $user.PreferredAuthMethod),
+            @('', $user.SystemPreferredMethod),
+            @('', $user.LastUpdated)
+        )
+        $null = $builder.Append('        <tr data-usertype="').Append([System.Net.WebUtility]::HtmlEncode([string]$user.UserType))
+        $null = $builder.Append('" data-admin="').Append([System.Net.WebUtility]::HtmlEncode([string]$user.IsAdmin))
+        $null = $builder.Append('" data-status="').Append([System.Net.WebUtility]::HtmlEncode($statusText))
+        $null = $builder.Append('" data-mfa="').Append([System.Net.WebUtility]::HtmlEncode([string]$user.IsMfaRegistered))
+        $null = $builder.Append('" data-mfacapable="').Append([System.Net.WebUtility]::HtmlEncode([string]$user.IsMfaCapable))
+        $null = $builder.Append('" data-phishres="').Append([System.Net.WebUtility]::HtmlEncode([string]$user.IsPhishingResistantRegistered))
+        $null = $builder.Append('" data-sspr="').Append([System.Net.WebUtility]::HtmlEncode([string]$user.IsSsprRegistered))
+        $null = $builder.Append('" data-preferred="').Append([System.Net.WebUtility]::HtmlEncode($preferredValue))
+        $null = $builder.Append('" data-methods="').Append([System.Net.WebUtility]::HtmlEncode(([string]$user.MethodsRegistered).ToLower()))
+        $null = $builder.Append('" data-nonusable="').Append([System.Net.WebUtility]::HtmlEncode(([string]$user.NonUsableMethods).ToLower()))
+        if ($rowIndex -gt $HtmlPageSize) {
+            # Rows after the first page are hidden until the user asks for more (fast initial load).
+            $null = $builder.Append('" hidden>')
+        }
+        else {
+            $null = $builder.Append('">')
+        }
+        foreach ($cell in $cells) {
+            if ($cell[0]) {
+                $null = $builder.Append('<td class="').Append($cell[0]).Append('">')
+            }
+            else {
+                $null = $builder.Append('<td>')
+            }
+            $null = $builder.Append([System.Net.WebUtility]::HtmlEncode([string]$cell[1])).Append('</td>')
+        }
+        $null = $builder.Append("</tr>`n")
     }
-    $rowsHtml = @($rows) -join "`n"
+    $rowsHtml = $builder.ToString()
     $noUsersHtml = ''
     if ($totalUsers -eq 0) {
         $noUsersHtml = '<div class="empty" id="noUsers" role="status">No users in this report. No users were returned, or all users were left out by -ExcludeGuests / -ExcludeDisabled.</div>'
@@ -1008,12 +1213,15 @@ function New-AuthMethodsHtmlReport {
     .summary-note { color: #6b7280; font-size: 12px; margin: -12px 0 20px 0; }
     .table-wrap { max-height: 70vh; overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
     #rowCount { font-size: 12px; color: #6b7280; margin: 8px 0; }
+    tr[hidden] { display: none; }
+    .more { margin: 0 0 8px 0; font-size: 12px; color: #6b7280; }
+    .more button { font-size: 12px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; background: #fff; cursor: pointer; }
 </style>
 </head>
 <body>
 
 <h1>Entra ID Authentication Methods Report</h1>
-<div class="meta">Tenant $(ConvertTo-HtmlSafe $TenantDisplayName) ($(ConvertTo-HtmlSafe $TenantIdValue)) | Generated $generatedOn | Script version $ScriptVersion</div>
+<div class="meta">Tenant $(ConvertTo-HtmlSafe $TenantDisplayName) ($(ConvertTo-HtmlSafe $TenantIdValue)) | Generated <time id="generatedOn" datetime="$generatedOnUtc">$generatedOn ($generatedOnUtc)</time> | Script version $ScriptVersion</div>
 <div class="notice" id="sensitiveNotice" role="note"><strong>Sensitive report:</strong> this report contains sensitive information about user authentication methods, e.g. which admins have no MFA registered. Store it in a secure location with restricted access, do not share it unencrypted and delete it when it is no longer needed.</div>
 
 <div class="summary" id="summaryCards">
@@ -1081,7 +1289,8 @@ function New-AuthMethodsHtmlReport {
     </div>
 </div>
 
-<div id="rowCount"></div>
+<div id="rowCount" role="status"></div>
+<div class="more" id="moreRows" hidden><button type="button" id="showMore">Show $HtmlPageSize more</button> <button type="button" id="showAll">Show all</button> <span class="more-note">Large report: at most $HtmlPageSize matching rows are shown at a time to keep the page fast. Use the filters, or show more rows. The browser's find (Ctrl+F) only searches shown rows.</span></div>
 $noUsersHtml
 
 <div class="table-wrap">
@@ -1102,7 +1311,7 @@ $noUsersHtml
             <th>Non-usable Methods</th>
             <th>Preferred Method</th>
             <th>System Preferred Method</th>
-            <th>Last Updated</th>
+            <th title="ISO 8601, UTC">Last Updated (UTC)</th>
         </tr>
     </thead>
     <tbody>
@@ -1112,68 +1321,115 @@ $rowsHtml
 </div>
 
 <script>
+(function () {
+    'use strict';
     var searchBox = document.getElementById('searchBox');
-    var userTypeFilter = document.getElementById('userTypeFilter');
-    var adminFilter = document.getElementById('adminFilter');
-    var statusFilter = document.getElementById('statusFilter');
-    var mfaFilter = document.getElementById('mfaFilter');
-    var mfaCapableFilter = document.getElementById('mfaCapableFilter');
-    var phishResFilter = document.getElementById('phishResFilter');
-    var ssprFilter = document.getElementById('ssprFilter');
-    var preferredFilter = document.getElementById('preferredFilter');
     var methodsFilter = document.getElementById('methodsFilter');
-    var nonUsableFilter = document.getElementById('nonUsableFilter');
-    var rows = document.querySelectorAll('#reportTable tbody tr');
+    var selectIds = ['userTypeFilter', 'adminFilter', 'statusFilter', 'mfaFilter', 'mfaCapableFilter', 'phishResFilter', 'ssprFilter', 'preferredFilter', 'nonUsableFilter'];
+    var selects = {};
+    selectIds.forEach(function (id) { selects[id] = document.getElementById(id); });
     var rowCount = document.getElementById('rowCount');
+    var tbody = document.querySelector('#reportTable tbody');
+    var rowElements = tbody ? tbody.rows : [];
+    var total = rowElements.length;
+    var moreRows = document.getElementById('moreRows');
+    var pageSize = $HtmlPageSize;
+    var limit = pageSize;
 
-    function applyFilters() {
-        var search = searchBox.value.toLowerCase();
-        var userType = userTypeFilter.value;
-        var admin = adminFilter.value;
-        var status = statusFilter.value;
-        var mfa = mfaFilter.value;
-        var mfaCapable = mfaCapableFilter.value;
-        var phishRes = phishResFilter.value;
-        var sspr = ssprFilter.value;
-        var preferred = preferredFilter.value;
-        var methods = methodsFilter.value.toLowerCase();
-        var nonUsable = nonUsableFilter.value;
-        var visible = 0;
-
-        rows.forEach(function (row) {
-            var text = row.cells[0].textContent.toLowerCase() + " " + row.cells[1].textContent.toLowerCase();
-            var matches = true;
-
-            if (search && text.indexOf(search) === -1) { matches = false; }
-            if (userType && row.dataset.usertype !== userType) { matches = false; }
-            if (admin && row.dataset.admin !== admin) { matches = false; }
-            if (status && row.dataset.status !== status) { matches = false; }
-            if (mfa && row.dataset.mfa !== mfa) { matches = false; }
-            if (mfaCapable && row.dataset.mfacapable !== mfaCapable) { matches = false; }
-            if (phishRes && row.dataset.phishres !== phishRes) { matches = false; }
-            if (sspr && row.dataset.sspr !== sspr) { matches = false; }
-            if (preferred && row.dataset.preferred !== preferred) { matches = false; }
-            if (methods && row.dataset.methods.indexOf(methods) === -1) { matches = false; }
-            if (nonUsable) {
-                var rowNonUsable = row.dataset.nonusable ? row.dataset.nonusable.split('; ') : [];
-                if (nonUsable === '__any' && rowNonUsable.length === 0) { matches = false; }
-                else if (nonUsable === '__none' && rowNonUsable.length > 0) { matches = false; }
-                else if (nonUsable !== '__any' && nonUsable !== '__none' && rowNonUsable.indexOf(nonUsable) === -1) { matches = false; }
-            }
-
-            row.style.display = matches ? "" : "none";
-            if (matches) { visible++; }
-        });
-
-        rowCount.textContent = visible + " of " + rows.length + " users shown";
+    // Read every row once and cache the values used for filtering (no DOM reads while filtering).
+    var data = new Array(total);
+    for (var i = 0; i < total; i++) {
+        var row = rowElements[i];
+        var d = row.dataset;
+        data[i] = {
+            row: row,
+            hidden: row.hidden,
+            text: (row.cells[0].textContent + ' ' + row.cells[1].textContent).toLowerCase(),
+            usertype: d.usertype, admin: d.admin, status: d.status, mfa: d.mfa, mfacapable: d.mfacapable,
+            phishres: d.phishres, sspr: d.sspr, preferred: d.preferred,
+            methods: d.methods || '',
+            nonusable: d.nonusable ? d.nonusable.split('; ') : []
+        };
     }
 
-    [searchBox, userTypeFilter, adminFilter, statusFilter, mfaFilter, mfaCapableFilter, phishResFilter, ssprFilter, preferredFilter, methodsFilter, nonUsableFilter].forEach(function (el) {
-        el.addEventListener('input', applyFilters);
-        el.addEventListener('change', applyFilters);
+    function applyFilters(keepLimit) {
+        if (keepLimit !== true) { limit = pageSize; }
+        var search = searchBox.value.toLowerCase();
+        var methods = methodsFilter.value.toLowerCase();
+        var userType = selects.userTypeFilter.value;
+        var admin = selects.adminFilter.value;
+        var status = selects.statusFilter.value;
+        var mfa = selects.mfaFilter.value;
+        var mfaCapable = selects.mfaCapableFilter.value;
+        var phishRes = selects.phishResFilter.value;
+        var sspr = selects.ssprFilter.value;
+        var preferred = selects.preferredFilter.value;
+        var nonUsable = selects.nonUsableFilter.value;
+        var matched = 0;
+        var shown = 0;
+
+        // One pass over the cached data; only rows whose visibility changes are touched. At most
+        // 'limit' matching rows are shown.
+        for (var i = 0; i < total; i++) {
+            var item = data[i];
+            var matches = !(
+                (search && item.text.indexOf(search) === -1) ||
+                (userType && item.usertype !== userType) ||
+                (admin && item.admin !== admin) ||
+                (status && item.status !== status) ||
+                (mfa && item.mfa !== mfa) ||
+                (mfaCapable && item.mfacapable !== mfaCapable) ||
+                (phishRes && item.phishres !== phishRes) ||
+                (sspr && item.sspr !== sspr) ||
+                (preferred && item.preferred !== preferred) ||
+                (methods && item.methods.indexOf(methods) === -1) ||
+                (nonUsable === '__any' && item.nonusable.length === 0) ||
+                (nonUsable === '__none' && item.nonusable.length > 0) ||
+                (nonUsable && nonUsable !== '__any' && nonUsable !== '__none' && item.nonusable.indexOf(nonUsable) === -1)
+            );
+            var show = false;
+            if (matches) {
+                matched++;
+                if (shown < limit) { show = true; shown++; }
+            }
+            if (item.hidden === show) {
+                item.hidden = !show;
+                item.row.hidden = !show;
+            }
+        }
+
+        if (shown < matched) {
+            rowCount.textContent = matched + ' of ' + total + ' users match, first ' + shown + ' shown';
+        }
+        else {
+            rowCount.textContent = matched + ' of ' + total + ' users shown';
+        }
+        moreRows.hidden = (shown >= matched);
+    }
+
+    document.getElementById('showMore').addEventListener('click', function () { limit += pageSize; applyFilters(true); });
+    document.getElementById('showAll').addEventListener('click', function () { limit = total; applyFilters(true); });
+
+    // Text inputs are debounced while typing; change events and dropdowns apply immediately.
+    var timer = null;
+    function applyNow() {
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        applyFilters();
+    }
+    function applyDebounced() {
+        if (timer !== null) { clearTimeout(timer); }
+        timer = setTimeout(applyNow, total > 2000 ? 250 : 100);
+    }
+    [searchBox, methodsFilter].forEach(function (el) {
+        el.addEventListener('input', applyDebounced);
+        el.addEventListener('change', applyNow);
+    });
+    selectIds.forEach(function (id) {
+        selects[id].addEventListener('change', applyNow);
     });
 
     applyFilters();
+})();
 </script>
 
 </body>
@@ -1193,12 +1449,12 @@ try {
     Write-Verbose "Retrieving user authentication method registration details"
     $step = 'Report'
     $uri = 'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails?$top=999'
-    $registrationDetails = Get-MgGraphAllPages -Uri $uri
+    $registrationDetails = Get-MgGraphAllPage -Uri $uri
 
     Write-Verbose "Retrieving user account enabled/disabled status"
     $step = 'Users'
     $usersUri = 'https://graph.microsoft.com/v1.0/users?$select=id,accountEnabled&$top=999'
-    $userAccountDetails = Get-MgGraphAllPages -Uri $usersUri
+    $userAccountDetails = Get-MgGraphAllPage -Uri $usersUri
 
     $accountStatusLookup = @{}
     foreach ($accountUser in $userAccountDetails) {
@@ -1248,10 +1504,10 @@ try {
             IsSsprEnabled         = $user.isSsprEnabled
             IsPasswordlessCapable = $user.isPasswordlessCapable
             MethodsRegistered     = ($user.methodsRegistered -join '; ')
-            NonUsableMethods      = Get-NonUsableMethods -RegisteredMethods $user.methodsRegistered -PolicyState $policyState
+            NonUsableMethods      = Get-NonUsableMethod -RegisteredMethods $user.methodsRegistered -PolicyState $policyState
             PreferredAuthMethod   = $user.userPreferredMethodForSecondaryAuthentication
             SystemPreferredMethod = (@($user.systemPreferredAuthenticationMethods) -join '; ')
-            LastUpdated           = $user.lastUpdatedDateTime
+            LastUpdated           = ConvertTo-UtcTimestamp -Value $user.lastUpdatedDateTime
         }
     }
     $report = @($report)
@@ -1270,25 +1526,20 @@ try {
 
     if ($OutputPath) {
         if ($PSCmdlet.ShouldProcess($OutputPath, "Export authentication method report as CSV")) {
-            if ($report.Count -gt 0) {
-                $report | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-            }
-            else {
-                # Export-Csv writes nothing for an empty report; write the header row only.
-                $csvHeader = ($ReportColumns | ForEach-Object { '"' + $_ + '"' }) -join ','
-                Set-Content -Path $OutputPath -Value $csvHeader -Encoding UTF8
+            Export-AuthMethodsCsv -Report $report -Path $OutputPath -Columns $ReportColumns
+            if ($report.Count -eq 0) {
                 Write-Warning "The report contains no users. The CSV report $OutputPath contains the header row only."
             }
-            Write-Host "CSV report exported to $OutputPath"
+            Write-Information "CSV report exported to $OutputPath"
             Write-Warning "The CSV report $OutputPath $SensitiveReportWarning"
         }
     }
 
     if ($HtmlPath) {
         if ($PSCmdlet.ShouldProcess($HtmlPath, "Export authentication method report as HTML")) {
-            $htmlContent = New-AuthMethodsHtmlReport -Report $report -TenantDisplayName $tenant.DisplayName -TenantIdValue $tenant.Id
+            $htmlContent = ConvertTo-AuthMethodsHtml -Report $report -TenantDisplayName $tenant.DisplayName -TenantIdValue $tenant.Id
             Set-Content -Path $HtmlPath -Value $htmlContent -Encoding UTF8
-            Write-Host "HTML report exported to $HtmlPath"
+            Write-Information "HTML report exported to $HtmlPath"
             if ($report.Count -eq 0) {
                 Write-Warning "The report contains no users. The HTML report $HtmlPath has no rows."
             }
@@ -1296,7 +1547,11 @@ try {
         }
     }
 
-    Write-Output $report
+    Write-Information "Report contains $($report.Count) user(s)."
+    # Without an export path the objects are the result; with an export path only with -PassThru.
+    if ($PassThru -or (-not $OutputPath -and -not $HtmlPath)) {
+        Write-Output $report
+    }
 }
 catch {
     $failure = Get-AuthMethodsFailure -ErrorRecord $_ -Step $step
