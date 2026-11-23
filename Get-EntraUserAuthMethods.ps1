@@ -10,12 +10,20 @@
     methods whose policy configuration is not returned by Graph are reported as '<method> (unknown)'.
     Results can be exported to CSV and to an interactive HTML report with client side filtering.
     Only read-only Graph calls (GET) are used.
+    An existing Microsoft Graph session is only reused if it belongs to the requested tenant and has
+    the required scopes; otherwise the script connects again. The connected tenant name and id are
+    always shown before any data is read.
+    The exported reports contain sensitive information (e.g. which admins have no MFA registered).
+    Store them in a secure location with restricted access and delete them when no longer needed.
 .PARAMETER OutputPath
     Optional path to export the results as CSV. If omitted, no CSV is created.
 .PARAMETER HtmlPath
     Optional path to export the results as an interactive HTML report with client side filtering.
 .PARAMETER TenantId
-    Optional tenant ID to connect to a specific tenant.
+    Optional tenant to connect to, as a tenant ID (GUID) or a verified domain name
+    (e.g. contoso.onmicrosoft.com). If an existing Graph session belongs to another tenant, the
+    script connects to this tenant instead. A domain name is compared against the verified domains
+    of the connected tenant.
 .EXAMPLE
     .\Get-EntraUserAuthMethods.ps1 -OutputPath C:\Reports\AuthMethods.csv
 .EXAMPLE
@@ -24,10 +32,17 @@
     Kasper Johansen | Apento
     kmj@apento.com
 
-    Version: 1.5.2
+    Version: 1.5.3
     Updated: 2026-11-23
 
     Changelog
+    1.5.3 - 2026-11-23
+        Tenant and scope check: an existing Graph session is only reused if it belongs to -TenantId
+        (tenant ID or verified domain name) and has the required scopes, otherwise Connect-MgGraph
+        is called again. The connected tenant name and id are shown before data is read and added
+        to the HTML report header. App-only sessions in the wrong tenant or with missing permissions
+        stop with an error instead of reconnecting. Sensitive report handling: a warning is shown
+        when a CSV or HTML report is exported, and the HTML report shows a sensitive data notice.
     1.5.2 - 2026-11-23
         NonUsableMethods fix: a registered method whose policy configuration is missing from the
         policy response is now reported as '<method> (unknown)' instead of non-usable. HardwareOath
@@ -82,7 +97,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '1.5.2'
+$ScriptVersion = '1.5.3'
+$RequiredScopes = @('AuditLog.Read.All', 'User.Read.All', 'Policy.Read.All')
+$SensitiveReportWarning = 'contains sensitive information about user authentication methods (e.g. which admins have no MFA registered). Store it in a secure location with restricted access and delete it when it is no longer needed.'
 
 function Get-MgGraphAllPages {
     param(
@@ -174,6 +191,183 @@ function Get-NonUsableMethods {
     return ($nonUsable -join '; ')
 }
 
+function Get-MissingGraphScope {
+    # Returns the required scopes that are not present in the granted scopes. A ReadWrite scope
+    # (e.g. User.ReadWrite.All) is accepted in place of the matching Read scope (User.Read.All).
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [string[]]$GrantedScopes,
+
+        [Parameter(Mandatory)]
+        [string[]]$RequiredScopes
+    )
+
+    $granted = @($GrantedScopes | Where-Object { $_ })
+    $missing = foreach ($scope in $RequiredScopes) {
+        $readWriteScope = $scope -replace '\.Read\.', '.ReadWrite.'
+        if (-not (($granted -contains $scope) -or ($granted -contains $readWriteScope))) {
+            $scope
+        }
+    }
+    return @($missing)
+}
+
+function Get-GraphTenantInfo {
+    # Reads the connected tenant's display name, id and verified domains (read-only GET).
+    # Returns $null if the organization cannot be read.
+    try {
+        $orgUri = 'https://graph.microsoft.com/v1.0/organization?$select=displayName,id,verifiedDomains'
+        $orgResponse = Invoke-MgGraphRequest -Method GET -Uri $orgUri
+        $org = @($orgResponse.value) | Select-Object -First 1
+        if ($org) {
+            return [PSCustomObject]@{
+                Id              = [string]$org.id
+                DisplayName     = [string]$org.displayName
+                VerifiedDomains = @($org.verifiedDomains | ForEach-Object { [string]$_.name } | Where-Object { $_ })
+            }
+        }
+    }
+    catch {
+        Write-Verbose "Tenant organization details could not be read: $($_.Exception.Message)"
+    }
+    return $null
+}
+
+function Test-GraphTenantMatch {
+    # Returns $true if the Graph context belongs to the requested tenant, $false if it does not,
+    # or $null if it cannot be determined (domain name given and verified domains not readable).
+    param(
+        [Parameter(Mandatory)]
+        [object]$Context,
+
+        [Parameter(Mandatory)]
+        [string]$TenantId,
+
+        [Parameter()]
+        [AllowNull()]
+        [object]$TenantInfo
+    )
+
+    $tenantGuid = [guid]::Empty
+    if ([guid]::TryParse($TenantId, [ref]$tenantGuid)) {
+        return ([string]$Context.TenantId -eq $tenantGuid.ToString())
+    }
+    if ($TenantInfo -and $TenantInfo.VerifiedDomains.Count -gt 0) {
+        return ($TenantInfo.VerifiedDomains -contains $TenantId.Trim())
+    }
+    return $null
+}
+
+function Connect-AuthMethodsGraph {
+    # Reuses an existing Graph session only if it belongs to the requested tenant and has the
+    # required scopes. Otherwise connects with the required scopes (and -TenantId). Shows and
+    # returns the connected tenant.
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$RequiredScopes,
+
+        [Parameter()]
+        [string]$TenantId
+    )
+
+    $context = Get-MgContext
+    $tenantInfo = $null
+    $reason = $null
+
+    if (-not $context) {
+        $reason = 'no existing Microsoft Graph session'
+    }
+    else {
+        $isAppOnly = ([string]$context.AuthType -eq 'AppOnly')
+
+        if ($TenantId) {
+            $tenantInfo = Get-GraphTenantInfo
+            $tenantMatch = Test-GraphTenantMatch -Context $context -TenantId $TenantId -TenantInfo $tenantInfo
+            if ($tenantMatch -ne $true) {
+                if ($tenantMatch -eq $false) {
+                    $reason = "the existing Microsoft Graph session belongs to tenant $($context.TenantId), not '$TenantId'"
+                }
+                else {
+                    $reason = "it could not be verified that the existing Microsoft Graph session (tenant $($context.TenantId)) belongs to '$TenantId'"
+                }
+                if ($isAppOnly) {
+                    throw "Cannot reuse the app-only Microsoft Graph session: $reason. Connect the app to the correct tenant with Connect-MgGraph -TenantId and run the script again."
+                }
+            }
+        }
+
+        if (-not $reason) {
+            $missingScopes = @(Get-MissingGraphScope -GrantedScopes $context.Scopes -RequiredScopes $RequiredScopes)
+            if ($missingScopes.Count -gt 0) {
+                if ($isAppOnly) {
+                    throw "The app-only Microsoft Graph session is missing the application permission(s): $($missingScopes -join ', '). Grant them (with admin consent) to the app registration and run the script again."
+                }
+                $reason = "the existing Microsoft Graph session is missing the scope(s): $($missingScopes -join ', ')"
+            }
+        }
+    }
+
+    if ($reason) {
+        Write-Information "Connecting to Microsoft Graph: $reason." -InformationAction Continue
+        $connectParams = @{
+            Scopes = $RequiredScopes
+        }
+        if ($TenantId) {
+            $connectParams['TenantId'] = $TenantId
+        }
+        elseif ($context -and $context.TenantId) {
+            # Reconnecting only because of missing scopes: stay in the same tenant.
+            $connectParams['TenantId'] = $context.TenantId
+        }
+        Connect-MgGraph @connectParams | Out-Null
+
+        $context = Get-MgContext
+        if (-not $context) {
+            throw 'Connect-MgGraph did not establish a Microsoft Graph session.'
+        }
+        $tenantInfo = $null
+
+        $missingScopes = @(Get-MissingGraphScope -GrantedScopes $context.Scopes -RequiredScopes $RequiredScopes)
+        if ($missingScopes.Count -gt 0) {
+            Write-Warning "The Microsoft Graph session is missing the scope(s): $($missingScopes -join ', '). Parts of the report may fail."
+        }
+    }
+    else {
+        Write-Verbose "Reusing existing Microsoft Graph session for tenant $($context.TenantId)"
+    }
+
+    if (-not $tenantInfo) {
+        $tenantInfo = Get-GraphTenantInfo
+    }
+
+    if ($TenantId) {
+        $tenantMatch = Test-GraphTenantMatch -Context $context -TenantId $TenantId -TenantInfo $tenantInfo
+        if ($tenantMatch -eq $false) {
+            throw "The Microsoft Graph session belongs to tenant $($context.TenantId), not '$TenantId'. No data has been read."
+        }
+        elseif ($null -eq $tenantMatch) {
+            Write-Warning "Could not verify that tenant $($context.TenantId) has the verified domain '$TenantId', because the tenant's verified domains could not be read."
+        }
+    }
+
+    if ($tenantInfo) {
+        $tenantDisplayName = $tenantInfo.DisplayName
+        $tenantIdValue = $tenantInfo.Id
+    }
+    else {
+        $tenantDisplayName = '(name not available)'
+        $tenantIdValue = [string]$context.TenantId
+        Write-Warning "The tenant name could not be read from /organization. Verify that tenant $tenantIdValue is the expected tenant."
+    }
+    Write-Information "Connected to tenant: $tenantDisplayName ($tenantIdValue) as $($context.Account)" -InformationAction Continue
+
+    return [PSCustomObject]@{
+        DisplayName = $tenantDisplayName
+        Id          = $tenantIdValue
+    }
+}
+
 function ConvertTo-HtmlSafe {
     # HTML encodes a value so it can be safely inserted into HTML element content and quoted
     # attribute values. Null returns an empty string.
@@ -196,7 +390,13 @@ function ConvertTo-HtmlSafe {
 function New-AuthMethodsHtmlReport {
     param(
         [Parameter(Mandatory)]
-        [array]$Report
+        [array]$Report,
+
+        [Parameter()]
+        [string]$TenantDisplayName,
+
+        [Parameter()]
+        [string]$TenantIdValue
     )
 
     $generatedOn = Get-Date -Format "yyyy-MM-dd HH:mm"
@@ -258,7 +458,8 @@ function New-AuthMethodsHtmlReport {
     :root { --border: #d9dde3; --head: #1f2937; --yes: #1a7f37; --no: #b42318; }
     body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; color: #1f2937; background: #f7f8fa; }
     h1 { font-size: 20px; margin-bottom: 4px; }
-    .meta { color: #6b7280; font-size: 13px; margin-bottom: 20px; }
+    .meta { color: #6b7280; font-size: 13px; margin-bottom: 12px; }
+    .notice { background: #fff4e5; border: 1px solid #f5b971; border-left: 4px solid #b54708; border-radius: 6px; color: #7a2e0e; font-size: 13px; padding: 10px 14px; margin-bottom: 20px; }
     .summary { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
     .card { background: #fff; border: 1px solid var(--border); border-radius: 6px; padding: 10px 16px; min-width: 140px; }
     .card .num { font-size: 22px; font-weight: 600; }
@@ -279,7 +480,8 @@ function New-AuthMethodsHtmlReport {
 <body>
 
 <h1>Entra ID Authentication Methods Report</h1>
-<div class="meta">Generated $generatedOn | Script version $ScriptVersion</div>
+<div class="meta">Tenant $(ConvertTo-HtmlSafe $TenantDisplayName) ($(ConvertTo-HtmlSafe $TenantIdValue)) | Generated $generatedOn | Script version $ScriptVersion</div>
+<div class="notice" id="sensitiveNotice" role="note"><strong>Sensitive report:</strong> this report contains sensitive information about user authentication methods, e.g. which admins have no MFA registered. Store it in a secure location with restricted access, do not share it unencrypted and delete it when it is no longer needed.</div>
 
 <div class="summary">
     <div class="card"><div class="num">$totalUsers</div><div class="label">Total users</div></div>
@@ -426,15 +628,7 @@ $rowsHtml
 }
 
 try {
-    if (-not (Get-MgContext)) {
-        $connectParams = @{
-            Scopes = @('AuditLog.Read.All', 'User.Read.All', 'Policy.Read.All')
-        }
-        if ($TenantId) {
-            $connectParams['TenantId'] = $TenantId
-        }
-        Connect-MgGraph @connectParams
-    }
+    $tenant = Connect-AuthMethodsGraph -RequiredScopes $RequiredScopes -TenantId $TenantId
 
     Write-Verbose "Get-EntraUserAuthMethods version $ScriptVersion"
     Write-Verbose "Retrieving user authentication method registration details"
@@ -500,14 +694,16 @@ try {
         if ($PSCmdlet.ShouldProcess($OutputPath, "Export authentication method report as CSV")) {
             $report | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
             Write-Host "CSV report exported to $OutputPath"
+            Write-Warning "The CSV report $OutputPath $SensitiveReportWarning"
         }
     }
 
     if ($HtmlPath) {
         if ($PSCmdlet.ShouldProcess($HtmlPath, "Export authentication method report as HTML")) {
-            $htmlContent = New-AuthMethodsHtmlReport -Report $report
+            $htmlContent = New-AuthMethodsHtmlReport -Report $report -TenantDisplayName $tenant.DisplayName -TenantIdValue $tenant.Id
             Set-Content -Path $HtmlPath -Value $htmlContent -Encoding UTF8
             Write-Host "HTML report exported to $HtmlPath"
+            Write-Warning "The HTML report $HtmlPath $SensitiveReportWarning"
         }
     }
 
