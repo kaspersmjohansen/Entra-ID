@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Retrieves all Entra ID users' registered and preferred authentication methods using Microsoft Graph.
@@ -26,6 +27,9 @@
     FIDO2 sign-in fails in the Windows PowerShell 5.1 sign-in window.
     The exported reports contain sensitive information (e.g. which admins have no MFA registered).
     Store them in a secure location with restricted access and delete them when no longer needed.
+    If a required Graph call fails, a clear error is shown and the script ends with a non-zero exit
+    code (see Exit codes in the notes); no partial report is written. The registration report
+    requires a Microsoft Entra ID P1 or P2 license in the tenant.
 .PARAMETER OutputPath
     Optional path to export the results as CSV. If omitted, no CSV is created.
 .PARAMETER HtmlPath
@@ -77,14 +81,29 @@
 .EXAMPLE
     .\Get-EntraUserAuthMethods.ps1 -HtmlPath C:\Reports\AuthMethods.html -TenantId contoso.onmicrosoft.com -UseWAM
     Signs in with the Windows Web Account Manager (e.g. with a passkey) in Windows PowerShell 5.1.
+.EXAMPLE
+    .\Get-EntraUserAuthMethods.ps1 -OutputPath C:\Reports\AuthMethods.csv
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Report failed with exit code $LASTEXITCODE" }
+    Checks the exit code, e.g. in a scheduled task (powershell.exe -File returns the same code).
 .NOTES
     Kasper Johansen | Apento
     kmj@apento.com
 
-    Version: 1.5.5
+    Version: 1.5.6
     Updated: 2026-11-23
 
     Changelog
+    1.5.6 - 2026-11-23
+        Least privilege: the Policy.Read.All scope is replaced by Policy.Read.AuthenticationMethod,
+        the least privileged permission for reading the Authentication Methods policy (v1.0) and
+        the HardwareOath configuration (beta). An existing session with Policy.Read.All (or
+        Policy.ReadWrite.AuthenticationMethod) is still accepted and does not force a reconnect.
+        Clear errors and exit codes: a failing userRegistrationDetails call is reported as a
+        missing Microsoft Entra ID P1/P2 license (exit 2) or missing role/permission (exit 3, e.g.
+        Reports Reader, Security Reader or Global Reader), with the Graph error code and HTTP
+        status. Other failures end with exit 1 (Graph or other errors) or exit 4 (sign-in, tenant
+        or session check); a successful run ends with exit 0. The persisted WAM option is restored
+        on every exit path. Get-Help now shows the comment-based help (blank line after #Requires).
     1.5.5 - 2026-11-23
         Added -UseWAM switch: sign in with the Windows Web Account Manager (WAM), e.g. for passkey /
         FIDO2 sign-in in Windows PowerShell 5.1. With Microsoft.Graph.Authentication 2.0.0 - 2.33.x,
@@ -150,12 +169,35 @@
         Initial version. Reads /reports/authenticationMethods/userRegistrationDetails.
         CSV export via -OutputPath.
 
-    Required Graph permission (delegated or application): AuditLog.Read.All, User.Read.All, Policy.Read.All
+    Required Graph permission (delegated or application): AuditLog.Read.All, User.Read.All,
+    Policy.Read.AuthenticationMethod
     AuditLog.Read.All grants read access to the authentication methods registration report.
     User.Read.All grants read access to each user's enabled/disabled account status.
-    Policy.Read.All grants read access to the tenant Authentication Methods policy, used to
-    determine which registered methods are disabled in the tenant and therefore non-usable.
+    Policy.Read.AuthenticationMethod grants read access to the tenant Authentication Methods
+    policy (v1.0) and the HardwareOath configuration (beta), used to determine which registered
+    methods are disabled in the tenant and therefore non-usable. It is the least privileged
+    permission for these calls. An existing session with the higher privileged Policy.Read.All or
+    Policy.ReadWrite.AuthenticationMethod is accepted too (Microsoft Learn does not list
+    Policy.Read.All for the beta HardwareOath call; if that call fails, hardware OATH tokens are
+    reported as '(unknown)').
+    With delegated sign-in the account also needs a Microsoft Entra role:
+    - Registration report: Reports Reader, Security Reader, Security Administrator or Global Reader.
+    - Authentication Methods policy: Global Reader or Authentication Policy Administrator.
+    Global Reader covers all calls. The registration report also requires a Microsoft Entra ID P1
+    or P2 license in the tenant.
     No write, update or delete calls are made anywhere in this script.
+
+    Exit codes
+    0 - Success (also when the report contains no users).
+    1 - Microsoft Graph or other error (e.g. throttling, network, export failure).
+    2 - The tenant has no Microsoft Entra ID P1 or P2 license (required by the registration
+        report), Graph error code Authentication_RequestFromNonPremiumTenantOrB2CTenant.
+    3 - Access denied (HTTP 403): the signed-in account or app is missing a required role or
+        permission.
+    4 - Sign-in or session error: Connect-MgGraph failed, the session belongs to another tenant,
+        an app-only session is missing permissions, or the Microsoft.Graph.Authentication module
+        is too old for -UseWAM.
+    The error message shows the Graph error code and HTTP status when available.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -180,11 +222,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '1.5.5'
+$ScriptVersion = '1.5.6'
 # Previous persisted WAM option (Get-MgGraphOption EnableWAMForMSGraph) to restore at the end, set by
 # Enable-AuthMethodsWam when it changes the option.
 $script:WamRestoreValue = $null
-$RequiredScopes = @('AuditLog.Read.All', 'User.Read.All', 'Policy.Read.All')
+$RequiredScopes = @('AuditLog.Read.All', 'User.Read.All', 'Policy.Read.AuthenticationMethod')
+# Exit codes (documented in the notes).
+$ExitCodeSuccess = 0
+$ExitCodeError = 1
+$ExitCodeLicense = 2
+$ExitCodePermission = 3
+$ExitCodeSignIn = 4
 # Report columns in CSV order. Used to write the CSV header when the report has no rows.
 $ReportColumns = @('UserPrincipalName', 'DisplayName', 'UserType', 'AccountEnabled', 'AccountStatus', 'IsAdmin',
     'IsMfaRegistered', 'IsMfaCapable', 'IsPhishingResistantRegistered', 'IsSsprRegistered', 'IsSsprEnabled',
@@ -361,6 +409,8 @@ function Test-ActiveMember {
 function Get-MissingGraphScope {
     # Returns the required scopes that are not present in the granted scopes. A ReadWrite scope
     # (e.g. User.ReadWrite.All) is accepted in place of the matching Read scope (User.Read.All).
+    # Higher privileged scopes listed in $alternativeScopes are accepted too, so an existing
+    # session with e.g. Policy.Read.All does not force a reconnect.
     param(
         [Parameter()]
         [AllowNull()]
@@ -370,10 +420,25 @@ function Get-MissingGraphScope {
         [string[]]$RequiredScopes
     )
 
+    # Higher privileged scopes that also grant the required scope (Microsoft Learn permissions
+    # tables for the API calls used by this script).
+    $alternativeScopes = @{
+        'Policy.Read.AuthenticationMethod' = @('Policy.Read.All')
+    }
+
     $granted = @($GrantedScopes | Where-Object { $_ })
     $missing = foreach ($scope in $RequiredScopes) {
-        $readWriteScope = $scope -replace '\.Read\.', '.ReadWrite.'
-        if (-not (($granted -contains $scope) -or ($granted -contains $readWriteScope))) {
+        $acceptedScopes = @($scope, ($scope -replace '\.Read\.', '.ReadWrite.'))
+        if ($alternativeScopes.ContainsKey($scope)) {
+            $acceptedScopes += $alternativeScopes[$scope]
+        }
+        $isGranted = $false
+        foreach ($acceptedScope in $acceptedScopes) {
+            if ($granted -contains $acceptedScope) {
+                $isGranted = $true
+            }
+        }
+        if (-not $isGranted) {
             $scope
         }
     }
@@ -532,6 +597,151 @@ function Restore-AuthMethodsWam {
     }
     finally {
         $script:WamRestoreValue = $null
+    }
+}
+
+function Get-GraphErrorDetail {
+    # Extracts the HTTP status code, Graph error code and message from an error record thrown by
+    # Invoke-MgGraphRequest (or any other error). Missing values are $null.
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $statusCode = $null
+    $errorCode = $null
+    $errorMessage = $null
+    $exception = $ErrorRecord.Exception
+
+    try {
+        if ($exception.PSObject.Properties['Response'] -and $exception.Response -and $exception.Response.PSObject.Properties['StatusCode']) {
+            $statusCode = [int]$exception.Response.StatusCode
+        }
+        elseif ($exception.PSObject.Properties['StatusCode'] -and $exception.StatusCode) {
+            $statusCode = [int]$exception.StatusCode
+        }
+    }
+    catch {
+        $statusCode = $null
+    }
+
+    $detailText = $null
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        $detailText = [string]$ErrorRecord.ErrorDetails.Message
+    }
+    $allText = (@($detailText, [string]$exception.Message) | Where-Object { $_ }) -join ' '
+
+    if ($detailText) {
+        try {
+            $errorBody = $detailText | ConvertFrom-Json -ErrorAction Stop
+            if ($errorBody.error) {
+                $errorCode = [string]$errorBody.error.code
+                $errorMessage = [string]$errorBody.error.message
+            }
+        }
+        catch {
+            Write-Verbose 'The Graph error details are not JSON.'
+        }
+    }
+    if (-not $errorCode -and $allText -match '"code"\s*:\s*"([^"]+)"') {
+        $errorCode = $Matches[1]
+    }
+    if (-not $errorCode -and $allText -match '\b(Authentication_RequestFromNonPremiumTenantOrB2CTenant|Authorization_RequestDenied|Authentication_RequestDenied|accessDenied)\b') {
+        $errorCode = $Matches[1]
+    }
+    if (-not $statusCode) {
+        if ($allText -match '(?:does not indicate success:|\bStatusCode\b\D{0,5}|\bHTTP/\d(?:\.\d)?)\s*(\d{3})\b') {
+            $statusCode = [int]$Matches[1]
+        }
+        elseif ($allText -match '\bForbidden\b') {
+            $statusCode = 403
+        }
+        elseif ($allText -match '\bUnauthorized\b') {
+            $statusCode = 401
+        }
+    }
+
+    return [PSCustomObject]@{
+        StatusCode = $statusCode
+        Code       = $errorCode
+        Message    = $errorMessage
+        Text       = $allText
+    }
+}
+
+function Get-AuthMethodsFailure {
+    # Classifies an error from a script step into an exit code and a clear message.
+    # Steps: SignIn, Report (userRegistrationDetails), Users, Policy, Other.
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('SignIn', 'Report', 'Users', 'Policy', 'Other')]
+        [string]$Step
+    )
+
+    $detail = Get-GraphErrorDetail -ErrorRecord $ErrorRecord
+    $codeParts = @()
+    if ($detail.Code) {
+        $codeParts += "Graph error code: $($detail.Code)"
+    }
+    if ($detail.StatusCode) {
+        $codeParts += "HTTP $($detail.StatusCode)"
+    }
+    $codeText = if ($codeParts.Count -gt 0) { " ($($codeParts -join ', '))" } else { '' }
+    $graphMessage = if ($detail.Message) { $detail.Message } else { $ErrorRecord.Exception.Message }
+
+    $isLicense = ([string]$detail.Code -match 'NonPremium') -or ($detail.Text -match 'premium licen[cs]e')
+    $isPermission = ($detail.StatusCode -eq 403) -or ([string]$detail.Code -in @('Authorization_RequestDenied', 'Authentication_RequestDenied', 'accessDenied', 'Forbidden'))
+
+    $stepText = switch ($Step) {
+        'Report' { 'the authentication methods registration report (/reports/authenticationMethods/userRegistrationDetails)' }
+        'Users' { 'the users account status (/users)' }
+        'Policy' { 'the tenant Authentication Methods policy (/policies/authenticationMethodsPolicy)' }
+        'SignIn' { 'Microsoft Graph sign-in' }
+        default { 'the report' }
+    }
+
+    if ($isLicense) {
+        return [PSCustomObject]@{
+            ExitCode = $ExitCodeLicense
+            ErrorId  = 'EntraIdPremiumLicenseRequired'
+            Category = [System.Management.Automation.ErrorCategory]::PermissionDenied
+            Message  = "Cannot read $stepText$codeText. The report requires a Microsoft Entra ID P1 or P2 license in the tenant (Azure AD B2C tenants are not supported). Assign an Entra ID P1/P2 license in the tenant and run the script again. No report was created. Graph message: $graphMessage"
+        }
+    }
+    if ($isPermission) {
+        $roleText = switch ($Step) {
+            'Report' { 'a Microsoft Entra role that can read the report, such as Reports Reader, Security Reader, Security Administrator or Global Reader, and the AuditLog.Read.All permission' }
+            'Users' { 'the User.Read.All permission and a role that can read users, such as Global Reader' }
+            'Policy' { 'the Policy.Read.AuthenticationMethod permission and a Microsoft Entra role such as Global Reader or Authentication Policy Administrator' }
+            default { 'the required permissions and a Microsoft Entra role such as Global Reader' }
+        }
+        return [PSCustomObject]@{
+            ExitCode = $ExitCodePermission
+            ErrorId  = 'GraphAccessDenied'
+            Category = [System.Management.Automation.ErrorCategory]::PermissionDenied
+            Message  = "Access denied reading $stepText$codeText. The signed-in account (or app) needs $roleText. For app-only sessions grant the application permission with admin consent. Activate the role (e.g. in PIM) and run the script again. No report was created. Graph message: $graphMessage"
+        }
+    }
+    if ($Step -eq 'SignIn' -or $detail.StatusCode -eq 401) {
+        return [PSCustomObject]@{
+            ExitCode = $ExitCodeSignIn
+            ErrorId  = 'GraphSignInFailed'
+            Category = [System.Management.Automation.ErrorCategory]::AuthenticationError
+            Message  = "Microsoft Graph sign-in or session check failed$codeText. No data has been read. $($ErrorRecord.Exception.Message)"
+        }
+    }
+    return [PSCustomObject]@{
+        ExitCode = $ExitCodeError
+        ErrorId  = 'AuthMethodsReportFailed'
+        Category = [System.Management.Automation.ErrorCategory]::NotSpecified
+        Message  = "Failed to retrieve authentication method report while reading $stepText$codeText. No report was created. $($ErrorRecord.Exception.Message)"
     }
 }
 
@@ -973,15 +1183,20 @@ $rowsHtml
     return $html
 }
 
+$exitCode = $ExitCodeSuccess
+# Current step, used to classify a failure (see Get-AuthMethodsFailure).
+$step = 'SignIn'
 try {
     $tenant = Connect-AuthMethodsGraph -RequiredScopes $RequiredScopes -TenantId $TenantId -UseWAM:$UseWAM
 
     Write-Verbose "Get-EntraUserAuthMethods version $ScriptVersion"
     Write-Verbose "Retrieving user authentication method registration details"
+    $step = 'Report'
     $uri = 'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails?$top=999'
     $registrationDetails = Get-MgGraphAllPages -Uri $uri
 
     Write-Verbose "Retrieving user account enabled/disabled status"
+    $step = 'Users'
     $usersUri = 'https://graph.microsoft.com/v1.0/users?$select=id,accountEnabled&$top=999'
     $userAccountDetails = Get-MgGraphAllPages -Uri $usersUri
 
@@ -991,6 +1206,7 @@ try {
     }
 
     Write-Verbose "Retrieving tenant authentication methods policy"
+    $step = 'Policy'
     $policyUri = 'https://graph.microsoft.com/v1.0/policies/authenticationMethodsPolicy'
     $authMethodsPolicy = Invoke-MgGraphRequest -Method GET -Uri $policyUri
 
@@ -1010,9 +1226,10 @@ try {
             }
         }
         catch {
-            Write-Verbose "HardwareOath policy state could not be read from beta, reported as unknown: $($_.Exception.Message)"
+            Write-Verbose "HardwareOath policy state could not be read from beta (requires Policy.Read.AuthenticationMethod), reported as unknown: $($_.Exception.Message)"
         }
     }
+    $step = 'Other'
 
     $report = foreach ($user in $registrationDetails) {
         $accountEnabled = $accountStatusLookup[$user.id]
@@ -1079,12 +1296,16 @@ try {
         }
     }
 
-    return $report
+    Write-Output $report
 }
 catch {
-    Write-Error "Failed to retrieve authentication method report: $($_.Exception.Message)"
+    $failure = Get-AuthMethodsFailure -ErrorRecord $_ -Step $step
+    $exitCode = $failure.ExitCode
+    # Non-terminating so the finally block and the exit code below always run.
+    Write-Error -Message $failure.Message -Category $failure.Category -ErrorId $failure.ErrorId -ErrorAction Continue
 }
 finally {
-    # Restore the persisted WAM option if -UseWAM changed it.
+    # Restore the persisted WAM option if -UseWAM changed it (runs on every exit path).
     Restore-AuthMethodsWam
 }
+exit $exitCode
