@@ -21,6 +21,11 @@
     For devices without a last sign-in: days since registration. Default = StaleDays (minimum 30).
 .PARAMETER ForceDelete
     Delete mode / UI: also deletes stale devices that are enabled or within the grace period. Logged as ForceDelete.
+.PARAMETER AuthMode
+    GraphCli (default): Microsoft Graph Command Line Tools (scopes need admin consent once).
+    UserRights: sign in with a preconsented Microsoft app, effective access = your Entra roles (no admin consent).
+.PARAMETER ClientId
+    Application (client) id to sign in with. Implies -AuthMode UserRights. Default: Azure PowerShell app.
 .PARAMETER ReadOnly
     Requests only Device.Read.All, blocks every write, refuses Disable/Delete, UI is view-only.
     BitLocker/LAPS status is read only if the session already has the key scopes, otherwise Unknown.
@@ -59,20 +64,18 @@
 .EXAMPLE
     .\Cleanup-StaleDevices.ps1 -TenantId contoso.onmicrosoft.com -HtmlPath .\stale.html -OutputPath .\stale.csv
 .EXAMPLE
-    .\Cleanup-StaleDevices.ps1 -ReadOnly -TenantId contoso.onmicrosoft.com -HtmlPath .\stale.html
+    .\Cleanup-StaleDevices.ps1 -AuthMode UserRights -TenantId contoso.onmicrosoft.com -Mode Disable -WhatIf
 .EXAMPLE
     .\Cleanup-StaleDevices.ps1 -Mode Disable -JoinType EntraJoined -OperatingSystem Windows -WhatIf
-.EXAMPLE
-    .\Cleanup-StaleDevices.ps1 -Mode UI
 .NOTES
     Kasper Johansen | Apento | kmj@apento.com
-    Version: 5.0.0 (2026-11-24). 5.0.0: rewritten (eligibility rules, key-loss protection, hardened UI, audit, -ReadOnly).
-    No app registration: Connect-MgGraph uses Microsoft Graph Command Line Tools. Scopes need admin consent once for it.
-    -ReadOnly: Device.Read.All (any member user). Key status also needs BitlockerKey.ReadBasic.All and
-    DeviceLocalCredential.ReadBasic.All + Global Reader / Security Reader / Helpdesk / Cloud Device Administrator.
-    Report: Device.Read.All + the two key scopes. Disable/Delete/UI: Directory.AccessAsUser.All (no narrower
-    delegated permission exists) + key scopes; app-only Device.ReadWrite.All. Role: Cloud Device Administrator
-    (delete: Intune Administrator / Windows 365 Administrator).
+    Version: 5.0.0 (2026-11-24). Rewritten: eligibility rules, key-loss protection, hardened UI, audit, -ReadOnly, -AuthMode.
+    Auth (no app registration): GraphCli = Microsoft Graph Command Line Tools (scopes need admin consent once).
+    -AuthMode UserRights = Azure PowerShell app (preconsented everywhere): access = your Entra roles via
+    Directory.AccessAsUser.All, no admin consent; it has no BitLocker/LAPS scopes, so key status is Unknown (delete needs -AllowKeyLoss).
+    Scopes (GraphCli): Report/-ReadOnly Device.Read.All; Disable/Delete/UI Directory.AccessAsUser.All (no narrower one);
+    key read BitlockerKey.ReadBasic.All + DeviceLocalCredential.ReadBasic.All; app-only Device.ReadWrite.All.
+    Role: Cloud Device Administrator (delete: Intune / Windows 365 Administrator); key read also needs a reader role.
     Exit codes: 0 success, 1 error or failed action, 3 access denied, 4 sign-in/session error.
 #>
 
@@ -96,6 +99,13 @@ param(
 
     [Parameter()]
     [switch]$ReadOnly,
+
+    [Parameter()]
+    [ValidateSet('GraphCli', 'UserRights')]
+    [string]$AuthMode = 'GraphCli',
+
+    [Parameter()]
+    [string]$ClientId,
 
     [Parameter()]
     [switch]$ForceDelete,
@@ -170,9 +180,22 @@ $GraphBase = 'https://graph.microsoft.com/v1.0'
 $DeviceSelect = 'id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,approximateLastSignInDateTime,registrationDateTime,accountEnabled,isManaged,physicalIds'
 $KeyHeaders = @{ 'ocp-client-name' = 'Cleanup-StaleDevices'; 'ocp-client-version' = $ScriptVersion }
 $KeyScopes = @('BitlockerKey.ReadBasic.All', 'DeviceLocalCredential.ReadBasic.All')
-$RequiredScopes = @(if ($ReadOnly -or $Mode -eq 'Report') { 'Device.Read.All' } else { 'Directory.AccessAsUser.All' })
-if (-not $SkipKeyCheck -and -not $ReadOnly) {
-    $RequiredScopes += $KeyScopes
+$AzurePowerShellAppId = '1950a258-227b-4e31-a9cf-717495945fc2'
+if ($ClientId -and $ClientId -notmatch $GuidPattern) {
+    throw "-ClientId must be a GUID."
+}
+$script:UserRights = ($AuthMode -eq 'UserRights') -or [bool]$ClientId
+$script:AuthClientId = if ($script:UserRights) { if ($ClientId) { $ClientId } else { $AzurePowerShellAppId } } else { '' }
+if ($script:UserRights) {
+    # First-party apps are preconsented for Directory.AccessAsUser.All only (not Device.Read.All or the key scopes),
+    # so request just that scope; the GET-only guard keeps -ReadOnly / Report runs read-only.
+    $RequiredScopes = @('Directory.AccessAsUser.All')
+}
+else {
+    $RequiredScopes = @(if ($ReadOnly -or $Mode -eq 'Report') { 'Device.Read.All' } else { 'Directory.AccessAsUser.All' })
+    if (-not $SkipKeyCheck -and -not $ReadOnly) {
+        $RequiredScopes += $KeyScopes
+    }
 }
 $MaxRetries = 5
 $MaxRetryAfterSeconds = 120
@@ -187,11 +210,12 @@ $script:AuditFile = $null
 $script:ActionCount = 0
 $script:WorstExit = $ExitCodeSuccess
 $script:ReadOnlyRun = ($ReadOnly -or $Mode -eq 'Report')
+$script:ProbeKeys = ($ReadOnly -or $script:UserRights) -and -not $SkipKeyCheck
 $script:SkipKeys = [bool]$SkipKeyCheck
 $script:KeySkip = @{ BitLocker = $false; Laps = $false }
 $script:Now = [datetime]::UtcNow
 $GuidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-$script:Tenant = [PSCustomObject]@{ DisplayName = ''; Id = ''; Account = ''; AppOnly = $false; Scopes = @() }
+$script:Tenant = [PSCustomObject]@{ DisplayName = ''; Id = ''; Account = ''; AppOnly = $false; ClientId = ''; Scopes = @() }
 
 function Get-MissingGraphScope {
     # Returns missing scopes. ReadWrite and higher privileged alternatives count as granted.
@@ -459,6 +483,9 @@ function Connect-StaleDevicesGraph {
         [string]$TenantId,
 
         [Parameter()]
+        [string]$ClientId,
+
+        [Parameter()]
         [switch]$UseWAM
     )
 
@@ -474,7 +501,14 @@ function Connect-StaleDevicesGraph {
     else {
         $isAppOnly = ([string]$context.AuthType -eq 'AppOnly')
 
-        if ($TenantId) {
+        if ($ClientId -and [string]$context.ClientId -ne $ClientId) {
+            if ($isAppOnly) {
+                throw "The existing Microsoft Graph session uses a different app ($($context.ClientId)). Disconnect-MgGraph and run again."
+            }
+            $reason = "the existing Microsoft Graph session uses app $($context.ClientId), not $ClientId"
+        }
+
+        if (-not $reason -and $TenantId) {
             $tenantInfo = Get-GraphTenantInfo
             $tenantMatch = Test-GraphTenantMatch -Context $context -TenantId $TenantId -TenantInfo $tenantInfo
             if ($tenantMatch -ne $true) {
@@ -505,6 +539,9 @@ function Connect-StaleDevicesGraph {
         Write-Information "Connecting to Microsoft Graph: $reason."
         $connectParams = @{
             Scopes = $RequiredScopes
+        }
+        if ($ClientId) {
+            $connectParams['ClientId'] = $ClientId
         }
         if ($TenantId) {
             $connectParams['TenantId'] = $TenantId
@@ -571,6 +608,7 @@ function Connect-StaleDevicesGraph {
         Id          = $tenantIdValue
         Account     = [string]$context.Account
         AppOnly     = ([string]$context.AuthType -eq 'AppOnly')
+        ClientId    = [string]$context.ClientId
         Scopes      = @($context.Scopes)
     }
 }
@@ -2021,22 +2059,30 @@ try {
         $step = 'Other'
         throw "-ReadOnly cannot be used with -Mode $Mode. Use -Mode Report or UI (the report shows CanDisable / CanDelete)."
     }
+    if ($script:UserRights -and -not $TenantId) {
+        $step = 'Other'
+        throw '-AuthMode UserRights (or -ClientId) needs -TenantId so the first-party app signs in to the right tenant.'
+    }
     if (-not (Get-Command -Name Connect-MgGraph -ErrorAction SilentlyContinue) -or -not (Get-Command -Name Invoke-MgGraphRequest -ErrorAction SilentlyContinue)) {
         throw 'Microsoft.Graph.Authentication is not installed. Run: Install-Module Microsoft.Graph.Authentication -Scope CurrentUser'
     }
 
     $step = 'SignIn'
-    $script:Tenant = Connect-StaleDevicesGraph -RequiredScopes $RequiredScopes -TenantId $TenantId -UseWAM:$UseWAM
+    $script:Tenant = Connect-StaleDevicesGraph -RequiredScopes $RequiredScopes -TenantId $TenantId -ClientId $script:AuthClientId -UseWAM:$UseWAM
     Write-Information "Mode: $Mode. $(Get-StaleDevicesSettingsText)"
+    if ($script:UserRights) {
+        Write-Information "Signed in with app $script:AuthClientId. Effective access = your Entra roles (Directory.AccessAsUser.All)."
+    }
     if ($ReadOnly) {
         Write-Information 'Read-only run: only GET requests are sent, no devices can be changed.'
-        if (-not $script:SkipKeys) {
-            $script:KeySkip.BitLocker = (@(Get-MissingGraphScope -GrantedScopes $script:Tenant.Scopes -RequiredScopes 'BitlockerKey.ReadBasic.All').Count -gt 0)
-            $script:KeySkip.Laps = (@(Get-MissingGraphScope -GrantedScopes $script:Tenant.Scopes -RequiredScopes 'DeviceLocalCredential.ReadBasic.All').Count -gt 0)
-            $skipped = @($KeyScopes | Where-Object { ($_ -like 'Bitlocker*' -and $script:KeySkip.BitLocker) -or ($_ -like 'DeviceLocal*' -and $script:KeySkip.Laps) })
-            if ($skipped.Count -gt 0) {
-                Write-Warning "Read-only: the session does not have $($skipped -join ', '), so that BitLocker/LAPS status is Unknown. Admin consent for these scopes adds it."
-            }
+    }
+    if ($script:ProbeKeys) {
+        $script:KeySkip.BitLocker = (@(Get-MissingGraphScope -GrantedScopes $script:Tenant.Scopes -RequiredScopes 'BitlockerKey.ReadBasic.All').Count -gt 0)
+        $script:KeySkip.Laps = (@(Get-MissingGraphScope -GrantedScopes $script:Tenant.Scopes -RequiredScopes 'DeviceLocalCredential.ReadBasic.All').Count -gt 0)
+        $skipped = @($KeyScopes | Where-Object { ($_ -like 'Bitlocker*' -and $script:KeySkip.BitLocker) -or ($_ -like 'DeviceLocal*' -and $script:KeySkip.Laps) })
+        if ($skipped.Count -gt 0) {
+            $hint = if ($script:UserRights) { 'This app has no BitLocker/LAPS scopes; use -AuthMode GraphCli for key status.' } else { 'Admin consent for these scopes adds it.' }
+            Write-Warning "The session does not have $($skipped -join ', '), so that BitLocker/LAPS status is Unknown. $hint"
         }
     }
     if ($WhatIfPreference) {
