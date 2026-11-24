@@ -21,6 +21,9 @@
     For devices without a last sign-in: days since registration. Default = StaleDays (minimum 30).
 .PARAMETER ForceDelete
     Delete mode / UI: also deletes stale devices that are enabled or within the grace period. Logged as ForceDelete.
+.PARAMETER ReadOnly
+    Requests only Device.Read.All, blocks every write, refuses Disable/Delete, UI is view-only.
+    BitLocker/LAPS status is read only if the session already has the key scopes, otherwise Unknown.
 .PARAMETER JoinType
     EntraJoined, Registered, HybridJoined or All (default).
 .PARAMETER OperatingSystem
@@ -56,24 +59,21 @@
 .EXAMPLE
     .\Cleanup-StaleDevices.ps1 -TenantId contoso.onmicrosoft.com -HtmlPath .\stale.html -OutputPath .\stale.csv
 .EXAMPLE
+    .\Cleanup-StaleDevices.ps1 -ReadOnly -TenantId contoso.onmicrosoft.com -HtmlPath .\stale.html
+.EXAMPLE
     .\Cleanup-StaleDevices.ps1 -Mode Disable -JoinType EntraJoined -OperatingSystem Windows -WhatIf
 .EXAMPLE
     .\Cleanup-StaleDevices.ps1 -Mode UI
 .NOTES
     Kasper Johansen | Apento | kmj@apento.com
-    Version: 5.0.0 (2026-11-24)
-
-    Changelog
-    5.0.0 - 2026-11-24 Rewritten: eligibility rules, exclusions, key-loss protection, hardened UI, audit log.
-
-    Permissions (delegated)
-    Report: Device.Read.All, BitlockerKey.ReadBasic.All, DeviceLocalCredential.ReadBasic.All.
-    Disable/Delete/UI: Directory.AccessAsUser.All (Graph has no narrower delegated permission for
-    device update/delete) + the two key scopes. App-only: Device.ReadWrite.All.
-    Role: Cloud Device Administrator (or Intune Administrator / Windows 365 Administrator for delete).
-
-    Exit codes
-    0 = success, 1 = a device action failed or other error, 3 = access denied, 4 = sign-in/session error
+    Version: 5.0.0 (2026-11-24). 5.0.0: rewritten (eligibility rules, key-loss protection, hardened UI, audit, -ReadOnly).
+    No app registration: Connect-MgGraph uses Microsoft Graph Command Line Tools. Scopes need admin consent once for it.
+    -ReadOnly: Device.Read.All (any member user). Key status also needs BitlockerKey.ReadBasic.All and
+    DeviceLocalCredential.ReadBasic.All + Global Reader / Security Reader / Helpdesk / Cloud Device Administrator.
+    Report: Device.Read.All + the two key scopes. Disable/Delete/UI: Directory.AccessAsUser.All (no narrower
+    delegated permission exists) + key scopes; app-only Device.ReadWrite.All. Role: Cloud Device Administrator
+    (delete: Intune Administrator / Windows 365 Administrator).
+    Exit codes: 0 success, 1 error or failed action, 3 access denied, 4 sign-in/session error.
 #>
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
@@ -93,6 +93,9 @@ param(
     [Parameter()]
     [ValidateRange(30, 3650)]
     [int]$NoSignInDays,
+
+    [Parameter()]
+    [switch]$ReadOnly,
 
     [Parameter()]
     [switch]$ForceDelete,
@@ -167,8 +170,8 @@ $GraphBase = 'https://graph.microsoft.com/v1.0'
 $DeviceSelect = 'id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,approximateLastSignInDateTime,registrationDateTime,accountEnabled,isManaged,physicalIds'
 $KeyHeaders = @{ 'ocp-client-name' = 'Cleanup-StaleDevices'; 'ocp-client-version' = $ScriptVersion }
 $KeyScopes = @('BitlockerKey.ReadBasic.All', 'DeviceLocalCredential.ReadBasic.All')
-$RequiredScopes = @(if ($Mode -eq 'Report') { 'Device.Read.All' } else { 'Directory.AccessAsUser.All' })
-if (-not $SkipKeyCheck) {
+$RequiredScopes = @(if ($ReadOnly -or $Mode -eq 'Report') { 'Device.Read.All' } else { 'Directory.AccessAsUser.All' })
+if (-not $SkipKeyCheck -and -not $ReadOnly) {
     $RequiredScopes += $KeyScopes
 }
 $MaxRetries = 5
@@ -183,9 +186,12 @@ $SensitiveReportWarning = 'contains device information. Store it securely and de
 $script:AuditFile = $null
 $script:ActionCount = 0
 $script:WorstExit = $ExitCodeSuccess
+$script:ReadOnlyRun = ($ReadOnly -or $Mode -eq 'Report')
+$script:SkipKeys = [bool]$SkipKeyCheck
+$script:KeySkip = @{ BitLocker = $false; Laps = $false }
 $script:Now = [datetime]::UtcNow
 $GuidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-$script:Tenant = [PSCustomObject]@{ DisplayName = ''; Id = ''; Account = ''; AppOnly = $false }
+$script:Tenant = [PSCustomObject]@{ DisplayName = ''; Id = ''; Account = ''; AppOnly = $false; Scopes = @() }
 
 function Get-MissingGraphScope {
     # Returns missing scopes. ReadWrite and higher privileged alternatives count as granted.
@@ -565,6 +571,7 @@ function Connect-StaleDevicesGraph {
         Id          = $tenantIdValue
         Account     = [string]$context.Account
         AppOnly     = ([string]$context.AuthType -eq 'AppOnly')
+        Scopes      = @($context.Scopes)
     }
 }
 
@@ -723,6 +730,9 @@ function Invoke-StaleDevicesGraph {
         [hashtable]$Headers
     )
 
+    if ($Method -ne 'GET' -and $script:ReadOnlyRun) {
+        throw "Read-only run: $Method requests are blocked."
+    }
     $attempt = 0
     while ($true) {
         $attempt++
@@ -850,26 +860,30 @@ function Get-DeviceKeyIndex {
     param()
 
     $index = @{ BitLocker = $null; Laps = $null }
-    if ($SkipKeyCheck) {
+    if ($script:SkipKeys) {
         return $index
     }
-    try {
-        $keys = Get-MgGraphAllPage -Uri "$GraphBase/informationProtection/bitlocker/recoveryKeys" -Headers $KeyHeaders
-        $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($key in $keys) { if ($key.deviceId) { [void]$set.Add([string]$key.deviceId) } }
-        $index.BitLocker = $set
+    if (-not $script:KeySkip.BitLocker) {
+        try {
+            $keys = Get-MgGraphAllPage -Uri "$GraphBase/informationProtection/bitlocker/recoveryKeys" -Headers $KeyHeaders
+            $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($key in $keys) { if ($key.deviceId) { [void]$set.Add([string]$key.deviceId) } }
+            $index.BitLocker = $set
+        }
+        catch {
+            Write-Warning "BitLocker keys could not be read (status Unknown, delete blocked without -AllowKeyLoss): $($_.Exception.Message)"
+        }
     }
-    catch {
-        Write-Warning "BitLocker keys could not be read (status Unknown, delete blocked without -AllowKeyLoss): $($_.Exception.Message)"
-    }
-    try {
-        $creds = Get-MgGraphAllPage -Uri "$GraphBase/directory/deviceLocalCredentials?`$select=id,deviceName" -Headers $KeyHeaders
-        $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($cred in $creds) { if ($cred.id) { [void]$set.Add([string]$cred.id) } }
-        $index.Laps = $set
-    }
-    catch {
-        Write-Warning "LAPS passwords could not be read (status Unknown, delete blocked without -AllowKeyLoss): $($_.Exception.Message)"
+    if (-not $script:KeySkip.Laps) {
+        try {
+            $creds = Get-MgGraphAllPage -Uri "$GraphBase/directory/deviceLocalCredentials?`$select=id,deviceName" -Headers $KeyHeaders
+            $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($cred in $creds) { if ($cred.id) { [void]$set.Add([string]$cred.id) } }
+            $index.Laps = $set
+        }
+        catch {
+            Write-Warning "LAPS passwords could not be read (status Unknown, delete blocked without -AllowKeyLoss): $($_.Exception.Message)"
+        }
     }
     return $index
 }
@@ -909,7 +923,7 @@ function Get-DeviceKeyStatusLive {
     )
 
     $status = @{ BitLocker = 'Unknown'; Laps = 'Unknown' }
-    if ($SkipKeyCheck -or $DeviceId -notmatch $GuidPattern) {
+    if ($script:SkipKeys -or $DeviceId -notmatch $GuidPattern) {
         return $status
     }
     try {
@@ -1140,6 +1154,11 @@ function Invoke-StaleDeviceAction {
         DeviceId     = ''
         Detail       = ''
     }
+    if ($script:ReadOnlyRun) {
+        $entry.Result = 'Blocked'; $entry.Detail = 'Read-only run.'
+        Write-StaleDeviceAudit -Entry $entry
+        return $entry
+    }
     if ($ObjectId -notmatch $GuidPattern) {
         $entry.Result = 'Blocked'; $entry.Detail = 'Invalid object id.'
         Write-StaleDeviceAudit -Entry $entry
@@ -1223,7 +1242,7 @@ function Get-StaleDevicesFailure {
     $isPermission = ($Step -notin @('Module', 'Other')) -and (($detail.StatusCode -eq 403) -or ([string]$detail.Code -in @('Authorization_RequestDenied', 'Authentication_RequestDenied', 'accessDenied', 'Forbidden')))
 
     if ($isPermission) {
-        $need = if ($Step -eq 'Actions') { 'Directory.AccessAsUser.All (app-only: Device.ReadWrite.All) and Cloud Device Administrator (or Intune / Windows 365 Administrator for delete)' } else { 'Device.Read.All' }
+        $need = if ($Step -eq 'Actions') { 'Directory.AccessAsUser.All (app-only: Device.ReadWrite.All) and Cloud Device Administrator (or Intune / Windows 365 Administrator for delete)' } else { 'Device.Read.All (delegated: admin consent once for Microsoft Graph Command Line Tools)' }
         return [PSCustomObject]@{
             ExitCode = $ExitCodePermission; ErrorId = 'GraphAccessDenied'
             Category = [System.Management.Automation.ErrorCategory]::PermissionDenied
@@ -1267,11 +1286,12 @@ function Get-StaleDevicesSettingsText {
     param()
 
     $flags = @()
+    if ($ReadOnly) { $flags += 'ReadOnly' }
     if ($ForceDelete) { $flags += 'ForceDelete' }
     if ($IncludeAutopilot) { $flags += 'IncludeAutopilot' }
     if ($IncludeIntuneManaged) { $flags += 'IncludeIntuneManaged' }
     if ($AllowKeyLoss) { $flags += 'AllowKeyLoss' }
-    if ($SkipKeyCheck) { $flags += 'SkipKeyCheck' }
+    if ($script:SkipKeys) { $flags += 'SkipKeyCheck' }
     $flagText = if ($flags.Count -gt 0) { ', ' + ($flags -join ', ') } else { '' }
     return "StaleDays $StaleDays, GraceDays $GraceDays, NoSignInDays $NoSignInDays, JoinType $JoinType, OS $OperatingSystem$flagText"
 }
@@ -1559,7 +1579,8 @@ function Get-UiState {
         operator    = $script:Tenant.Account
         settings    = (Get-StaleDevicesSettingsText)
         whatIf      = [bool]$WhatIfPreference
-        forceDelete = [bool]$ForceDelete
+        readOnly    = [bool]$script:ReadOnlyRun
+        forceDelete = [bool]$ForceDelete -and -not $script:ReadOnlyRun
         maxDevices  = $MaxDevices
         actionsUsed = $script:ActionCount
         summary     = (Get-StaleDevicesSummary -Rows $rows)
@@ -1582,6 +1603,9 @@ function Invoke-UiAction {
         [object]$Body
     )
 
+    if ($script:ReadOnlyRun) {
+        return @{ status = 403; error = 'Read-only run: actions are disabled.' }
+    }
     $actionMap = @{ disable = 'Disable'; delete = 'Delete'; forcedelete = 'ForceDelete' }
     $confirmText = @{ Disable = 'DISABLE'; Delete = 'DELETE'; ForceDelete = 'FORCE DELETE' }
     $actionKey = [string]$Body.action
@@ -1797,7 +1821,7 @@ th{background:#f3f4f6;position:sticky;top:0}
 </head>
 <body>
 <header>
-<h1>Cleanup-StaleDevices <span id="whatif" class="badge" hidden>WhatIf: no changes</span></h1>
+<h1>Cleanup-StaleDevices <span id="whatif" class="badge" hidden>WhatIf: no changes</span> <span id="readonly" class="badge" hidden>Read-only: view only</span></h1>
 <div class="meta">Tenant: <span id="tenant"></span> | Signed in: <span id="operator"></span></div>
 <div class="meta">Settings: <span id="settings"></span></div>
 </header>
@@ -1878,6 +1902,9 @@ th{background:#f3f4f6;position:sticky;top:0}
     setText(el('limit'), state.actionsUsed + ' of ' + state.maxDevices + ' device actions used');
     el('whatif').hidden = !state.whatIf;
     el('forceBtn').hidden = !state.forceDelete;
+    el('readonly').hidden = !state.readOnly;
+    ['selAllBtn', 'selNoneBtn', 'disableBtn', 'deleteBtn'].forEach(function (id) { el(id).hidden = state.readOnly; });
+    if (state.readOnly) { selected = {}; }
     fill('fStatus', unique('status')); fill('fJoin', unique('joinType')); fill('fOs', unique('os'));
     renderRows();
   }
@@ -1899,7 +1926,7 @@ th{background:#f3f4f6;position:sticky;top:0}
       var td = document.createElement('td');
       var cb = document.createElement('input');
       cb.type = 'checkbox';
-      cb.disabled = !(d.canDisable || d.canDelete || d.canForceDelete);
+      cb.disabled = state.readOnly || !(d.canDisable || d.canDelete || d.canForceDelete);
       cb.checked = !!selected[d.objectId];
       cb.addEventListener('change', function () { if (cb.checked) { selected[d.objectId] = d; } else { delete selected[d.objectId]; } updateSel(); });
       td.appendChild(cb); tr.appendChild(td);
@@ -1990,6 +2017,10 @@ $step = 'Module'
 $actionResults = [System.Collections.Generic.List[object]]::new()
 try {
     Write-Verbose "Cleanup-StaleDevices version $ScriptVersion"
+    if ($ReadOnly -and $Mode -in @('Disable', 'Delete')) {
+        $step = 'Other'
+        throw "-ReadOnly cannot be used with -Mode $Mode. Use -Mode Report or UI (the report shows CanDisable / CanDelete)."
+    }
     if (-not (Get-Command -Name Connect-MgGraph -ErrorAction SilentlyContinue) -or -not (Get-Command -Name Invoke-MgGraphRequest -ErrorAction SilentlyContinue)) {
         throw 'Microsoft.Graph.Authentication is not installed. Run: Install-Module Microsoft.Graph.Authentication -Scope CurrentUser'
     }
@@ -1997,6 +2028,17 @@ try {
     $step = 'SignIn'
     $script:Tenant = Connect-StaleDevicesGraph -RequiredScopes $RequiredScopes -TenantId $TenantId -UseWAM:$UseWAM
     Write-Information "Mode: $Mode. $(Get-StaleDevicesSettingsText)"
+    if ($ReadOnly) {
+        Write-Information 'Read-only run: only GET requests are sent, no devices can be changed.'
+        if (-not $script:SkipKeys) {
+            $script:KeySkip.BitLocker = (@(Get-MissingGraphScope -GrantedScopes $script:Tenant.Scopes -RequiredScopes 'BitlockerKey.ReadBasic.All').Count -gt 0)
+            $script:KeySkip.Laps = (@(Get-MissingGraphScope -GrantedScopes $script:Tenant.Scopes -RequiredScopes 'DeviceLocalCredential.ReadBasic.All').Count -gt 0)
+            $skipped = @($KeyScopes | Where-Object { ($_ -like 'Bitlocker*' -and $script:KeySkip.BitLocker) -or ($_ -like 'DeviceLocal*' -and $script:KeySkip.Laps) })
+            if ($skipped.Count -gt 0) {
+                Write-Warning "Read-only: the session does not have $($skipped -join ', '), so that BitLocker/LAPS status is Unknown. Admin consent for these scopes adds it."
+            }
+        }
+    }
     if ($WhatIfPreference) {
         Write-Information '-WhatIf: no devices are changed.'
     }
