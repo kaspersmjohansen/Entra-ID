@@ -1,1085 +1,2095 @@
-<#PSScriptInfo
-.VERSION
-    4.6
-
-.AUTHOR
-    Kasper Johansen
-
-.COMPANYNAME
-    KMJ-Consulting
-
-.RELEASENOTES
-    v4.6 - Connection and startup fixes:
-           - Listener uses a custom port (default 8734, range 1024-65535).
-             A clear error is shown if the port is in use (use -Port to change).
-           - Fixed false "Not connected" for accounts with a single directory
-             role (roles was sent as a string instead of an array).
-           - Status check retries only on network errors; other errors are
-             shown with their actual message.
-           - Edge 143+ Local Network Access support (private-network headers,
-             OPTIONS preflight handler).
-           - Missing Microsoft Graph modules are installed automatically
-             (CurrentUser scope); #Requires -Modules removed.
-           - Fixed Export CSV button doing nothing (parseDate was out of scope).
-             CSV is now UTF-8 with BOM for Excel and keeps AccountEnabled=false.
-    v4.5 - Added signed-in user name, UPN and assigned directory roles to the
-           connection status card. The /me call is expanded to include displayName
-           and userPrincipalName. Role displayNames are fetched alongside roleTemplateIds
-           in the transitiveMemberOf call and passed through /status as the roles array.
-           Roles that grant write access are shown with an accent-coloured pill;
-           read-only roles use the default muted pill style.
-    v4.4 - Fixed permission indicator showing Read/Write for Global Reader accounts.
-           The previous check used OAuth scopes (Device.ReadWrite.All) which are
-           granted at the app consent level and do not reflect the signed-in user's
-           Entra directory role. Replaced with a GET /v1.0/me/transitiveMemberOf
-           role check against the known roleTemplateIds for Cloud Device Admin,
-           Intune Admin, Windows 365 Admin, Global Admin, and Privileged Role Admin.
-           Updated tooltips to reference the Entra directory role rather than scopes.
-    v4.3 - Added permission indicator to the connection status banner. After auth,
-           the actual granted scopes are checked via Get-MgContext. If
-           Device.ReadWrite.All was not granted (consent denied or insufficient
-           Entra role), a Read-only amber pill is shown and the Disable and Remove
-           buttons are disabled with a tooltip explaining why. A Read/Write green
-           pill is shown when write access is confirmed. The readOnly flag is
-           passed from the PS listener to the browser via the /status endpoint.
-    v4.2 - Added Last check-in date column to the results table showing the
-           absolute locale date of the last sign-in alongside the existing
-           relative age column. Also added to the CSV export as LastSignInDate.
-    v4.1 - Fixed pendingAction being nulled by closeConfirm() before executeAction()
-           could read it, causing "Starting null on N device(s)" and "Unknown action"
-           errors when removing or disabling devices from the UI.
-           Fixed raw Unicode characters (tick, cross, em-dash) being mangled in the
-           HTTP response by replacing them with HTML entities (&#10003;, &#10007;,
-           &mdash;) which are ASCII-safe regardless of encoding.
-           Fixed Ctrl+C not stopping the listener by replacing the blocking
-           GetContext() call with async BeginGetContext() polled every 500 ms.
-           Fixed double login prompt by moving Connect-MgGraph before the HTTP
-           listener starts so the auth flow cannot block the listener thread.
-           Fixed last sign-in and registered dates not displaying by casting Graph
-           datetime values to ISO 8601 strings before ConvertTo-Json serialisation,
-           avoiding the legacy /Date(...)/ format emitted by PowerShell 5.1.
-           Fixed null-coalescing operator (??) on line 45 replaced with PS 5.1
-           compatible if/else for Retry-After handling.
-           Changed Connected status banner to show the tenant primary domain name
-           instead of the tenant GUID, resolved via GET /v1.0/organization.
-    v4.0 - Added browser-based UI via embedded HTTP listener. Authentication now
-           happens before the listener starts to avoid thread-blocking issues.
-           Ctrl+C handled cleanly via async BeginGetContext polling.
-    v3.0 - Implemented -DisableDevice and -RemoveDevice actions. Added pagination
-           via Get-GraphPagedResults. Added WhatIf/Confirm support. Moved to
-           Graph API v1.0. Fixed DeviceId vs ObjectId for mutations.
-    v2.0 - Added -DisabledDevices scope, -ExportToCSV, and Graph session reuse.
-    v1.0 - Initial release.
-#>
+#Requires -Version 5.1
 
 <#
 .SYNOPSIS
-    Identifies and manages stale or disabled devices in Microsoft Entra ID via
-    a browser-based UI backed by a local Microsoft Graph API HTTP listener.
-
+    Finds stale Entra ID devices and disables or deletes them (report, staged runs or local web UI).
 .DESCRIPTION
-    Cleanup-StaleDevices launches a local HTTP server and opens a browser UI
-    for querying, reviewing, and acting on stale or disabled Entra ID devices
-    without requiring any parameters to be typed on the command line.
-
-    Authentication to Microsoft Graph is handled before the UI starts. The script
-    requests Device.ReadWrite.All so both read and write operations are covered
-    by a single cached token, avoiding double login prompts.
-
-    The UI supports:
-      - Filtering by join type (Entra joined, Hybrid joined, Registered)
-      - Filtering by operating system
-      - Querying stale devices by inactivity threshold (days since last sign-in)
-      - Querying all disabled devices regardless of last sign-in
-      - Selecting individual or all devices for bulk action
-      - Disabling selected devices (accountEnabled = false)
-      - Permanently removing selected devices from Entra ID
-      - Exporting results to a CSV file directly from the browser
-      - Colour-coded last sign-in ages (amber > 90 days, red > 180 days)
-
-    Disable and Remove operations include a confirmation dialog in the UI and use
-    a retry loop with Retry-After handling for Graph API throttling (HTTP 429).
-
-    Press Ctrl+C in the PowerShell window to stop the listener and exit.
-
+    Stale = last sign-in older than -StaleDays (no sign-in: registered more than -NoSignInDays ago).
+    Disable: stale and enabled. Delete: disabled and inactive for -StaleDays + -GraceDays.
+    Report only (never changed): Hybrid joined (clean up in on-premises AD), unknown join type,
+    Autopilot and Intune-managed devices (unless -IncludeAutopilot / -IncludeIntuneManaged).
+    Delete is blocked for devices with BitLocker keys or LAPS passwords (or unknown) unless -AllowKeyLoss.
+    Every rule is checked again against Graph right before a device is changed.
+    Modes: Report (read-only), Disable, Delete, UI (local web UI on 127.0.0.1 with CSRF token).
+.PARAMETER Mode
+    Report (default), Disable, Delete or UI.
+.PARAMETER StaleDays
+    Days without sign-in before a device is stale. Default 90, minimum 30.
+.PARAMETER GraceDays
+    Extra days a disabled device is kept before it can be deleted. Default 30.
+.PARAMETER NoSignInDays
+    For devices without a last sign-in: days since registration. Default = StaleDays (minimum 30).
+.PARAMETER ForceDelete
+    Delete mode / UI: also deletes stale devices that are enabled or within the grace period. Logged as ForceDelete.
+.PARAMETER JoinType
+    EntraJoined, Registered, HybridJoined or All (default).
+.PARAMETER OperatingSystem
+    Windows, macOS, iOS, Android, Linux, Other or All (default).
+.PARAMETER IncludeAutopilot
+    Allows actions on Windows Autopilot devices (cannot be reprovisioned after delete).
+.PARAMETER IncludeIntuneManaged
+    Allows actions on Intune/MDM-managed devices (retire them in Intune first).
+.PARAMETER AllowKeyLoss
+    Allows deleting devices with BitLocker recovery keys or LAPS passwords (or where this is unknown).
+.PARAMETER SkipKeyCheck
+    Does not request the BitLocker/LAPS read scopes. Key status is Unknown, so delete needs -AllowKeyLoss.
+.PARAMETER MaxDevices
+    Maximum devices changed per run (Disable/Delete stop before any change if more). Default 50.
+.PARAMETER IncludeActive
+    Report: also lists devices that are not stale.
+.PARAMETER OutputPath
+    CSV report (UTF-8 with BOM, formula injection protected).
+.PARAMETER HtmlPath
+    HTML report.
+.PARAMETER AuditPath
+    Audit CSV for every action (appended). Default: StaleDevices-Audit-<UTC time>.csv in the current folder.
 .PARAMETER Port
-    TCP port for the local HTTP listener (1024-65535). Default is 8734.
-    Change this if the default port is already in use on the machine.
-
+    UI port on 127.0.0.1 (1024-65535). Default 8734.
+.PARAMETER NoBrowser
+    UI: does not open the browser.
+.PARAMETER TenantId
+    Tenant ID (GUID) or verified domain name. Reconnects if the current session is another tenant.
+.PARAMETER UseWAM
+    Signs in with the Windows Web Account Manager (passkey / FIDO2 in Windows PowerShell 5.1).
+.PARAMETER PassThru
+    Also returns the report rows / action results when files are written.
 .EXAMPLE
-    .\Cleanup-StaleDevices.ps1
-
-    Connects to Microsoft Graph (browser auth prompt), then opens the UI at
-    http://localhost:8734/. Use the UI to set filters and query devices.
-
+    .\Cleanup-StaleDevices.ps1 -TenantId contoso.onmicrosoft.com -HtmlPath .\stale.html -OutputPath .\stale.csv
 .EXAMPLE
-    .\Cleanup-StaleDevices.ps1 -Port 9000
-
-    Starts the listener on port 9000 instead of the default 8734. Useful if
-    another process is already bound to 8734.
-
+    .\Cleanup-StaleDevices.ps1 -Mode Disable -JoinType EntraJoined -OperatingSystem Windows -WhatIf
 .EXAMPLE
-    # Typical stale device cleanup workflow:
-    # 1. Run the script - authenticate in the browser window that opens first.
-    # 2. In the UI, set Join type = Entra joined, OS = Windows, threshold = 90 days.
-    # 3. Click Query devices to retrieve matching devices.
-    # 4. Review the table - last sign-in ages are colour-coded for quick triage.
-    # 5. Select devices to act on, click Disable selected, confirm in the dialog.
-    # 6. Once satisfied, select remaining and click Remove selected.
-    # 7. Press Ctrl+C in the PowerShell window to stop the listener.
-
-.EXAMPLE
-    # Reviewing disabled devices before removal:
-    # 1. Run the script and authenticate.
-    # 2. In the UI, set Device scope = Disabled devices.
-    # 3. Click Query devices - returns all disabled devices regardless of age.
-    # 4. Use Export CSV to save the list before taking any action.
-    # 5. Select all, click Remove selected, confirm.
-
+    .\Cleanup-StaleDevices.ps1 -Mode UI
 .NOTES
-    Version : 4.1
-    Author  : Kasper Johansen | KMJ-Consulting
+    Kasper Johansen | Apento | kmj@apento.com
+    Version: 5.0.0 (2026-11-24)
 
-    Requires PowerShell 5.1 or later (enforced at runtime by Install-RequiredModules).
-    Requires the following Microsoft Graph PowerShell SDK modules (auto-installed
-    from PSGallery into the CurrentUser scope if missing):
-      - Microsoft.Graph.Authentication
-      - Microsoft.Graph.Identity.DirectoryManagement
+    Changelog
+    5.0.0 - 2026-11-24 Rewritten: eligibility rules, exclusions, key-loss protection, hardened UI, audit log.
 
-    The Graph connection uses Device.ReadWrite.All. If an existing session already
-    has this scope for the target tenant it is reused without prompting again.
+    Permissions (delegated)
+    Report: Device.Read.All, BitlockerKey.ReadBasic.All, DeviceLocalCredential.ReadBasic.All.
+    Disable/Delete/UI: Directory.AccessAsUser.All (Graph has no narrower delegated permission for
+    device update/delete) + the two key scopes. App-only: Device.ReadWrite.All.
+    Role: Cloud Device Administrator (or Intune Administrator / Windows 365 Administrator for delete).
 
-    The HTTP listener uses BeginGetContext() polled at 500 ms intervals rather than
-    the blocking GetContext(), so Ctrl+C in the PowerShell window stops the script
-    cleanly within half a second.
-
-    Date values (last sign-in, registered) are cast to ISO 8601 UTC strings before
-    JSON serialisation to avoid the legacy /Date(...)/ format emitted by
-    ConvertTo-Json in Windows PowerShell 5.1 when serialising [datetime] objects.
-
-    The connected tenant banner resolves the primary domain via
-    GET /v1.0/organization?$select=verifiedDomains and falls back to the tenant
-    GUID if no default domain is found.
-
-    All Unicode characters in the embedded HTML are expressed as HTML entities to
-    ensure correct rendering regardless of HTTP response encoding.
-
-.LINK
-    https://github.com/kaspersmjohansen/Entra-ID
-
-.LINK
-    https://kasperjohansen.net
-
-.LINK
-    https://learn.microsoft.com/en-us/graph/api/resources/device
+    Exit codes
+    0 = success, 1 = a device action failed or other error, 3 = access denied, 4 = sign-in/session error
 #>
 
-[CmdletBinding(SupportsShouldProcess, ConfirmImpact = "High")]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
+    [Parameter()]
+    [ValidateSet('Report', 'Disable', 'Delete', 'UI')]
+    [string]$Mode = 'Report',
+
+    [Parameter()]
+    [ValidateRange(30, 3650)]
+    [int]$StaleDays = 90,
+
+    [Parameter()]
+    [ValidateRange(0, 3650)]
+    [int]$GraceDays = 30,
+
+    [Parameter()]
+    [ValidateRange(30, 3650)]
+    [int]$NoSignInDays,
+
+    [Parameter()]
+    [switch]$ForceDelete,
+
+    [Parameter()]
+    [ValidateSet('EntraJoined', 'Registered', 'HybridJoined', 'All')]
+    [string]$JoinType = 'All',
+
+    [Parameter()]
+    [ValidateSet('Windows', 'macOS', 'iOS', 'Android', 'Linux', 'Other', 'All')]
+    [string]$OperatingSystem = 'All',
+
+    [Parameter()]
+    [switch]$IncludeAutopilot,
+
+    [Parameter()]
+    [switch]$IncludeIntuneManaged,
+
+    [Parameter()]
+    [switch]$AllowKeyLoss,
+
+    [Parameter()]
+    [switch]$SkipKeyCheck,
+
+    [Parameter()]
+    [ValidateRange(1, 100000)]
+    [int]$MaxDevices = 50,
+
+    [Parameter()]
+    [switch]$IncludeActive,
+
+    [Parameter()]
+    [string]$OutputPath,
+
+    [Parameter()]
+    [string]$HtmlPath,
+
+    [Parameter()]
+    [string]$AuditPath,
+
+    [Parameter()]
     [ValidateRange(1024, 65535)]
-    [Int32]$Port = 8734
+    [int]$Port = 8734,
+
+    [Parameter()]
+    [switch]$NoBrowser,
+
+    [Parameter()]
+    [string]$TenantId,
+
+    [Parameter()]
+    [switch]$UseWAM,
+
+    [Parameter()]
+    [switch]$PassThru
 )
 
-# ── module bootstrap ─────────────────────────────────────────────────────────
-
-function Install-RequiredModules {
-    # Checks for the modules required by this script and installs any that are
-    # missing from the current user scope. Exits if PowerShell < 5.1.
-    if ($PSVersionTable.PSVersion -lt [version]"5.1") {
-        Write-Error "PowerShell 5.1 or later is required. Current version: $($PSVersionTable.PSVersion)"
-        exit 1
-    }
-
-    $RequiredModules = @(
-        "Microsoft.Graph.Authentication",
-        "Microsoft.Graph.Identity.DirectoryManagement"
-    )
-
-    foreach ($ModuleName in $RequiredModules) {
-        if (-not (Get-Module -Name $ModuleName -ListAvailable)) {
-            Write-Host "Module '$ModuleName' not found. Installing from PSGallery..." -ForegroundColor Yellow
-            try {
-                Install-Module -Name $ModuleName -Scope CurrentUser -Repository PSGallery -Force -AllowClobber -ErrorAction Stop
-                Write-Host "Module '$ModuleName' installed successfully." -ForegroundColor Green
-            }
-            catch {
-                Write-Error "Failed to install module '$ModuleName': $($_.Exception.Message)"
-                exit 1
-            }
-        }
-        else {
-            Write-Host "Module '$ModuleName' is available." -ForegroundColor Green
-        }
-
-        try {
-            Import-Module -Name $ModuleName -ErrorAction Stop
-        }
-        catch {
-            Write-Error "Failed to import module '$ModuleName': $($_.Exception.Message)"
-            exit 1
-        }
-    }
+$ErrorActionPreference = 'Stop'
+$ScriptVersion = '5.0.0'
+if (-not $PSBoundParameters.ContainsKey('InformationAction')) {
+    $InformationPreference = 'Continue'
 }
-
-Install-RequiredModules
-
-# ── helpers ──────────────────────────────────────────────────────────────────
-
-$JoinTypeMap = @{
-    EntraJoined  = "AzureAD"
-    HybridJoined = "ServerAD"
-    Registered   = "Workplace"
+if (-not $PSBoundParameters.ContainsKey('NoSignInDays')) {
+    $NoSignInDays = $StaleDays
 }
-
-function Get-GraphPagedResults {
-    param([string]$Uri)
-    $Results = [System.Collections.Generic.List[Object]]::new()
-    do {
-        $Response = Invoke-MgGraphRequest -Method Get -Uri $Uri -Headers @{ ConsistencyLevel = "eventual" }
-        if ($Response.value) { $Results.AddRange([Object[]]$Response.value) }
-        $Uri = $Response.'@odata.nextLink'
-    } while ($Uri)
-    return $Results
+$script:WamRestoreValue = $null
+$ExitCodeSuccess = 0
+$ExitCodeError = 1
+$ExitCodePermission = 3
+$ExitCodeSignIn = 4
+$GraphBase = 'https://graph.microsoft.com/v1.0'
+$DeviceSelect = 'id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,approximateLastSignInDateTime,registrationDateTime,accountEnabled,isManaged,physicalIds'
+$KeyHeaders = @{ 'ocp-client-name' = 'Cleanup-StaleDevices'; 'ocp-client-version' = $ScriptVersion }
+$KeyScopes = @('BitlockerKey.ReadBasic.All', 'DeviceLocalCredential.ReadBasic.All')
+$RequiredScopes = @(if ($Mode -eq 'Report') { 'Device.Read.All' } else { 'Directory.AccessAsUser.All' })
+if (-not $SkipKeyCheck) {
+    $RequiredScopes += $KeyScopes
 }
+$MaxRetries = 5
+$MaxRetryAfterSeconds = 120
+$JoinTypeLabels = @{ AzureAD = 'Entra joined'; Workplace = 'Registered'; ServerAD = 'Hybrid joined' }
+$JoinTypeFilter = @{ EntraJoined = 'AzureAD'; Registered = 'Workplace'; HybridJoined = 'ServerAD' }
+$ReportColumns = @('DisplayName', 'Status', 'Reason', 'JoinType', 'OperatingSystem', 'OperatingSystemVersion', 'AccountEnabled',
+    'LastSignIn', 'Registered', 'DaysInactive', 'DeleteEligibleFrom', 'IsManaged', 'Autopilot', 'BitLocker', 'Laps',
+    'CanDisable', 'CanDelete', 'CanForceDelete', 'DeviceId', 'ObjectId')
+$AuditColumns = @('TimestampUtc', 'Operator', 'TenantId', 'Mode', 'Action', 'Result', 'DisplayName', 'ObjectId', 'DeviceId', 'Detail')
+$SensitiveReportWarning = 'contains device information. Store it securely and delete it when no longer needed.'
+$script:AuditFile = $null
+$script:ActionCount = 0
+$script:WorstExit = $ExitCodeSuccess
+$script:Now = [datetime]::UtcNow
+$GuidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+$script:Tenant = [PSCustomObject]@{ DisplayName = ''; Id = ''; Account = ''; AppOnly = $false }
 
-function Invoke-MgGraphRequestWithRetry {
+function Get-MissingGraphScope {
+    # Returns missing scopes. ReadWrite and higher privileged alternatives count as granted.
     param(
-        [string]$Method,
-        [string]$Uri,
-        [hashtable]$Body,
-        [int]$MaxRetries = 3
+        [Parameter()]
+        [AllowNull()]
+        [string[]]$GrantedScopes,
+
+        [Parameter(Mandatory)]
+        [string[]]$RequiredScopes,
+
+        [Parameter()]
+        [switch]$AppOnly
     )
-    $Attempt = 0
-    do {
-        try {
-            $Params = @{ Method = $Method; Uri = $Uri; ErrorAction = "Stop" }
-            if ($Body) { $Params.Body = ($Body | ConvertTo-Json); $Params.ContentType = "application/json" }
-            Invoke-MgGraphRequest @Params
-            return
+
+    $alternativeScopes = @{
+        'Device.Read.All' = @('Device.ReadWrite.All', 'Directory.Read.All', 'Directory.ReadWrite.All', 'Directory.AccessAsUser.All')
+    }
+    if ($AppOnly) {
+        # Directory.AccessAsUser.All is delegated only; app-only writes need Device.ReadWrite.All.
+        $RequiredScopes = @($RequiredScopes | ForEach-Object { if ($_ -eq 'Directory.AccessAsUser.All') { 'Device.ReadWrite.All' } else { $_ } })
+    }
+
+    $granted = @($GrantedScopes | Where-Object { $_ })
+    $missing = foreach ($scope in $RequiredScopes) {
+        $acceptedScopes = @($scope, ($scope -replace '\.Read\.', '.ReadWrite.'))
+        if ($alternativeScopes.ContainsKey($scope)) {
+            $acceptedScopes += $alternativeScopes[$scope]
         }
-        catch {
-            $StatusCode = $_.Exception.Response.StatusCode.value__
-            if ($StatusCode -eq 429 -and $Attempt -lt $MaxRetries) {
-                $RetryAfter = $_.Exception.Response.Headers['Retry-After']
-                $Wait = if ($RetryAfter) { [int]$RetryAfter } else { 10 }
-                Start-Sleep -Seconds $Wait
+        $isGranted = $false
+        foreach ($acceptedScope in $acceptedScopes) {
+            if ($granted -contains $acceptedScope) {
+                $isGranted = $true
             }
-            else { throw }
         }
-        $Attempt++
-    } while ($Attempt -le $MaxRetries)
+        if (-not $isGranted) {
+            $scope
+        }
+    }
+    return @($missing)
 }
 
-function Get-StaleDevices {
-    param([Int32]$Age, [string]$JoinType, [string]$OS, [switch]$DisabledDevices)
-    $Base   = "https://graph.microsoft.com/v1.0"
-    $Select = "id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,approximateLastSignInDateTime,registrationDateTime,accountEnabled"
-    if ($DisabledDevices) {
-        $Uri = "$Base/devices?`$filter=operatingSystem eq '$OS' AND trustType eq '$JoinType' AND accountEnabled eq false&`$count=true&`$select=$Select"
+function Get-GraphTenantInfo {
+    # Tenant name, id and verified domains, or $null.
+    try {
+        $orgUri = 'https://graph.microsoft.com/v1.0/organization?$select=displayName,id,verifiedDomains'
+        $orgResponse = Invoke-MgGraphRequest -Method GET -Uri $orgUri
+        $org = @($orgResponse.value) | Select-Object -First 1
+        if ($org) {
+            return [PSCustomObject]@{
+                Id              = [string]$org.id
+                DisplayName     = [string]$org.displayName
+                VerifiedDomains = @($org.verifiedDomains | ForEach-Object { [string]$_.name } | Where-Object { $_ })
+            }
+        }
+    }
+    catch {
+        Write-Verbose "Tenant organization details could not be read: $($_.Exception.Message)"
+    }
+    return $null
+}
+
+function Test-GraphTenantMatch {
+    # $true / $false, or $null if a domain name cannot be verified.
+    param(
+        [Parameter(Mandatory)]
+        [object]$Context,
+
+        [Parameter(Mandatory)]
+        [string]$TenantId,
+
+        [Parameter()]
+        [AllowNull()]
+        [object]$TenantInfo
+    )
+
+    $tenantGuid = [guid]::Empty
+    if ([guid]::TryParse($TenantId, [ref]$tenantGuid)) {
+        return ([string]$Context.TenantId -eq $tenantGuid.ToString())
+    }
+    if ($TenantInfo -and $TenantInfo.VerifiedDomains.Count -gt 0) {
+        return ($TenantInfo.VerifiedDomains -contains $TenantId.Trim())
+    }
+    return $null
+}
+
+function Test-WindowsPlatform {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+    return ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+}
+
+function Get-GraphAuthModuleVersion {
+    # Version of the module that provides Connect-MgGraph, or $null.
+    [CmdletBinding()]
+    [OutputType([version])]
+    param()
+
+    $connectCommand = Get-Command -Name Connect-MgGraph -ErrorAction SilentlyContinue
+    if ($connectCommand -and $connectCommand.Module) {
+        return [version]$connectCommand.Module.Version
+    }
+    return $null
+}
+
+function Write-GraphModuleUpdateWarning {
+    # Warns on Windows when the module is older than 2.34.0 (WAM not default).
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if (-not (Test-WindowsPlatform)) {
+        return $false
+    }
+    $moduleVersion = Get-GraphAuthModuleVersion
+    if ($moduleVersion -and $moduleVersion -lt [version]'2.34.0') {
+        Write-Warning "Microsoft.Graph.Authentication $moduleVersion is used. Update to 2.34.0 or later with Update-Module Microsoft.Graph.Authentication (WAM by default, passkey / FIDO2 sign-in). Check the loaded version with Get-Module Microsoft.Graph.Authentication."
+        return $true
+    }
+    return $false
+}
+
+function Enable-StaleDevicesWam {
+    # Enables WAM before Connect-MgGraph (2.0 - 2.33); the persisted option is restored at the end.
+    # Returns NotWindows, Default, AlreadyEnabled or Enabled.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    if (-not (Test-WindowsPlatform)) {
+        Write-Warning '-UseWAM is ignored: WAM is only available on Windows.'
+        return 'NotWindows'
+    }
+
+    $moduleVersion = Get-GraphAuthModuleVersion
+
+    if ($moduleVersion -and $moduleVersion -ge [version]'2.34.0') {
+        Write-Information "-UseWAM: Microsoft.Graph.Authentication $moduleVersion uses WAM by default. No setting changed."
+        return 'Default'
+    }
+
+    $setOptionCommand = Get-Command -Name Set-MgGraphOption -ErrorAction SilentlyContinue
+    if (-not $setOptionCommand -or -not $setOptionCommand.Parameters.ContainsKey('EnableLoginByWAM')) {
+        $foundVersion = if ($moduleVersion) { [string]$moduleVersion } else { 'not found' }
+        throw "-UseWAM requires Microsoft.Graph.Authentication 2.0.0 or later, found version $foundVersion. Run Update-Module Microsoft.Graph.Authentication. No devices have been changed."
+    }
+
+    $previousValue = $false
+    $currentOption = Get-MgGraphOption -ErrorAction SilentlyContinue
+    if ($currentOption -and ($currentOption.PSObject.Properties.Name -contains 'EnableWAMForMSGraph')) {
+        $previousValue = [bool]$currentOption.EnableWAMForMSGraph
+    }
+
+    if ($previousValue) {
+        Write-Verbose 'Web Account Manager (WAM) sign-in is already enabled (Get-MgGraphOption).'
+        return 'AlreadyEnabled'
+    }
+
+    Set-MgGraphOption -EnableLoginByWAM $true
+    if ($null -eq $script:WamRestoreValue) {
+        $script:WamRestoreValue = $previousValue
+    }
+    Write-Information 'WAM sign-in enabled for this run (restored at the end).'
+    return 'Enabled'
+}
+
+function Restore-StaleDevicesWam {
+    [CmdletBinding()]
+    param()
+
+    if ($null -eq $script:WamRestoreValue) {
+        return
+    }
+    $restoreValue = [bool]$script:WamRestoreValue
+    try {
+        Set-MgGraphOption -EnableLoginByWAM $restoreValue
+        Write-Verbose "Web Account Manager (WAM) option restored to EnableLoginByWAM = $restoreValue"
+    }
+    catch {
+        Write-Warning "Could not restore the Web Account Manager (WAM) option. Run Set-MgGraphOption -EnableLoginByWAM `$$restoreValue to restore it: $($_.Exception.Message)"
+    }
+    finally {
+        $script:WamRestoreValue = $null
+    }
+}
+
+function Get-GraphErrorDetail {
+    # HTTP status, Graph error code and message from an error record.
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $statusCode = $null
+    $errorCode = $null
+    $errorMessage = $null
+    $exception = $ErrorRecord.Exception
+
+    try {
+        if ($exception.PSObject.Properties['Response'] -and $exception.Response -and $exception.Response.PSObject.Properties['StatusCode']) {
+            $statusCode = [int]$exception.Response.StatusCode
+        }
+        elseif ($exception.PSObject.Properties['StatusCode'] -and $exception.StatusCode) {
+            $statusCode = [int]$exception.StatusCode
+        }
+    }
+    catch {
+        $statusCode = $null
+    }
+
+    $detailText = $null
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        $detailText = [string]$ErrorRecord.ErrorDetails.Message
+    }
+    $allText = (@($detailText, [string]$exception.Message) | Where-Object { $_ }) -join ' '
+
+    if ($detailText) {
+        try {
+            $errorBody = $detailText | ConvertFrom-Json -ErrorAction Stop
+            if ($errorBody.error) {
+                $errorCode = [string]$errorBody.error.code
+                $errorMessage = [string]$errorBody.error.message
+            }
+        }
+        catch {
+            Write-Verbose 'The Graph error details are not JSON.'
+        }
+    }
+    if (-not $errorCode -and $allText -match '"code"\s*:\s*"([^"]+)"') {
+        $errorCode = $Matches[1]
+    }
+    if (-not $errorCode -and $allText -match '\b(Authentication_RequestFromNonPremiumTenantOrB2CTenant|Authorization_RequestDenied|Authentication_RequestDenied|accessDenied)\b') {
+        $errorCode = $Matches[1]
+    }
+    if (-not $statusCode) {
+        if ($allText -match '(?:does not indicate success:|\bStatusCode\b\D{0,5}|\bHTTP/\d(?:\.\d)?)\s*(\d{3})\b') {
+            $statusCode = [int]$Matches[1]
+        }
+        elseif ($allText -match '\bForbidden\b') {
+            $statusCode = 403
+        }
+        elseif ($allText -match '\bUnauthorized\b') {
+            $statusCode = 401
+        }
+    }
+
+    return [PSCustomObject]@{
+        StatusCode = $statusCode
+        Code       = $errorCode
+        Message    = $errorMessage
+        Text       = $allText
+    }
+}
+
+function Connect-StaleDevicesGraph {
+    # Reuses the session if tenant and scopes match, otherwise connects. Returns the tenant.
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$RequiredScopes,
+
+        [Parameter()]
+        [string]$TenantId,
+
+        [Parameter()]
+        [switch]$UseWAM
+    )
+
+    $null = Write-GraphModuleUpdateWarning
+
+    $context = Get-MgContext
+    $tenantInfo = $null
+    $reason = $null
+
+    if (-not $context) {
+        $reason = 'no existing Microsoft Graph session'
     }
     else {
-        $DevAge = (Get-Date).AddDays(-$Age).ToString("yyyy-MM-ddTHH:mm:ssZ")
-        $Uri = "$Base/devices?`$filter=approximateLastSignInDateTime le $DevAge AND operatingSystem eq '$OS' AND trustType eq '$JoinType'&`$count=true&`$select=$Select"
-    }
-    $Raw = Get-GraphPagedResults -Uri $Uri
-    return $Raw | ForEach-Object {
-        [PSCustomObject]@{
-            objectId               = $_.id
-            deviceId               = $_.deviceId
-            displayName            = $_.displayName
-            operatingSystem        = $_.operatingSystem
-            operatingSystemVersion = $_.operatingSystemVersion
-            trustType              = $_.trustType
-            lastSignIn             = if ($_.approximateLastSignInDateTime) { ([datetime]$_.approximateLastSignInDateTime).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null }
-            registered             = if ($_.registrationDateTime) { ([datetime]$_.registrationDateTime).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null }
-            accountEnabled         = $_.accountEnabled
+        $isAppOnly = ([string]$context.AuthType -eq 'AppOnly')
+
+        if ($TenantId) {
+            $tenantInfo = Get-GraphTenantInfo
+            $tenantMatch = Test-GraphTenantMatch -Context $context -TenantId $TenantId -TenantInfo $tenantInfo
+            if ($tenantMatch -ne $true) {
+                if ($tenantMatch -eq $false) {
+                    $reason = "the existing Microsoft Graph session belongs to tenant $($context.TenantId), not '$TenantId'"
+                }
+                else {
+                    $reason = "it could not be verified that the existing Microsoft Graph session (tenant $($context.TenantId)) belongs to '$TenantId'"
+                }
+                if ($isAppOnly) {
+                    throw "Cannot reuse the app-only Microsoft Graph session: $reason. Connect the app to the correct tenant and run the script again."
+                }
+            }
         }
-    } | Sort-Object lastSignIn
+
+        if (-not $reason) {
+            $missingScopes = @(Get-MissingGraphScope -GrantedScopes $context.Scopes -RequiredScopes $RequiredScopes -AppOnly:$isAppOnly)
+            if ($missingScopes.Count -gt 0) {
+                if ($isAppOnly) {
+                    throw "The app-only Microsoft Graph session is missing the application permission(s): $($missingScopes -join ', '). Grant them with admin consent."
+                }
+                $reason = "the existing Microsoft Graph session is missing the scope(s): $($missingScopes -join ', ')"
+            }
+        }
+    }
+
+    if ($reason) {
+        Write-Information "Connecting to Microsoft Graph: $reason."
+        $connectParams = @{
+            Scopes = $RequiredScopes
+        }
+        if ($TenantId) {
+            $connectParams['TenantId'] = $TenantId
+        }
+        elseif ($context -and $context.TenantId) {
+            # Missing scopes only: stay in the same tenant.
+            $connectParams['TenantId'] = $context.TenantId
+        }
+        if ($UseWAM) {
+            $null = Enable-StaleDevicesWam
+        }
+        Connect-MgGraph @connectParams | Out-Null
+
+        $context = Get-MgContext
+        if (-not $context) {
+            throw 'Connect-MgGraph did not establish a Microsoft Graph session.'
+        }
+        $tenantInfo = $null
+
+        $missingScopes = @(Get-MissingGraphScope -GrantedScopes $context.Scopes -RequiredScopes $RequiredScopes)
+        if ($missingScopes.Count -gt 0) {
+            Write-Warning "The Microsoft Graph session is missing the scope(s): $($missingScopes -join ', '). Parts of the run may fail."
+        }
+    }
+    else {
+        Write-Verbose "Reusing existing Microsoft Graph session for tenant $($context.TenantId)"
+        if ($UseWAM) {
+            if ([string]$context.AuthType -eq 'AppOnly') {
+                Write-Verbose '-UseWAM is ignored: the existing Microsoft Graph session is app-only (no interactive sign-in).'
+            }
+            else {
+                Write-Verbose '-UseWAM has no effect: the existing Microsoft Graph session is reused, no sign-in is needed.'
+            }
+        }
+    }
+
+    if (-not $tenantInfo) {
+        $tenantInfo = Get-GraphTenantInfo
+    }
+
+    if ($TenantId) {
+        $tenantMatch = Test-GraphTenantMatch -Context $context -TenantId $TenantId -TenantInfo $tenantInfo
+        if ($tenantMatch -eq $false) {
+            throw "The Microsoft Graph session belongs to tenant $($context.TenantId), not '$TenantId'. No devices have been changed."
+        }
+        elseif ($null -eq $tenantMatch) {
+            Write-Warning "Could not verify that tenant $($context.TenantId) has the domain '$TenantId'."
+        }
+    }
+
+    if ($tenantInfo) {
+        $tenantDisplayName = $tenantInfo.DisplayName
+        $tenantIdValue = $tenantInfo.Id
+    }
+    else {
+        $tenantDisplayName = '(name not available)'
+        $tenantIdValue = [string]$context.TenantId
+        Write-Warning "The tenant name could not be read. Verify that tenant $tenantIdValue is correct."
+    }
+    Write-Information "Connected to tenant: $tenantDisplayName ($tenantIdValue) as $($context.Account)"
+
+    return [PSCustomObject]@{
+        DisplayName = $tenantDisplayName
+        Id          = $tenantIdValue
+        Account     = [string]$context.Account
+        AppOnly     = ([string]$context.AuthType -eq 'AppOnly')
+    }
 }
 
-function Write-JsonResponse {
-    param($Context, [int]$Status = 200, $Body)
-    $Json  = $Body | ConvertTo-Json -Depth 5 -Compress
-    $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
-    $Context.Response.StatusCode        = $Status
-    $Context.Response.ContentType       = "application/json"
-    $Context.Response.ContentLength64   = $Bytes.Length
-    $Context.Response.Headers.Add("Access-Control-Allow-Origin", "*")
-    # Required by Edge 143+ Local Network Access (LNA) restrictions.
-    # Edge blocks fetch() calls to loopback addresses unless the server responds
-    # with this header on both the preflight OPTIONS and the actual request.
-    $Context.Response.Headers.Add("Access-Control-Allow-Private-Network", "true")
-    $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
-    $Context.Response.OutputStream.Close()
+function ConvertTo-CsvSafeRow {
+    # Prefixes text starting with = + - @ tab CR with ' (CSV formula injection).
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object]$Row
+    )
+
+    begin {
+        $formulaStart = [char[]]@('=', '+', '-', '@', [char]9, [char]13)
+    }
+    process {
+        $safeRow = [ordered]@{}
+        foreach ($property in $Row.PSObject.Properties) {
+            $value = $property.Value
+            if ($value -is [string] -and $value.Length -gt 0 -and $formulaStart -contains $value[0]) {
+                $value = "'" + $value
+            }
+            $safeRow[$property.Name] = $value
+        }
+        [PSCustomObject]$safeRow
+    }
 }
 
-function Write-HtmlResponse {
-    param($Context, [string]$Html)
-    $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Html)
-    $Context.Response.StatusCode        = 200
-    $Context.Response.ContentType       = "text/html; charset=utf-8"
-    $Context.Response.ContentLength64   = $Bytes.Length
-    # Required by Edge 143+ Local Network Access (LNA) restrictions.
-    $Context.Response.Headers.Add("Access-Control-Allow-Private-Network", "true")
-    $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
-    $Context.Response.OutputStream.Close()
+function Export-StaleDevicesCsv {
+    # CSV as UTF-8 with BOM (PS 5.1 and 7); header only for an empty report.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Report,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string[]]$Columns
+    )
+
+    $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    if ($Report.Count -gt 0) {
+        $lines = @($Report | ConvertTo-CsvSafeRow | ConvertTo-Csv -NoTypeInformation)
+    }
+    else {
+        $lines = @(($Columns | ForEach-Object { '"' + $_ + '"' }) -join ',')
+    }
+    $utf8WithBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $true
+    [System.IO.File]::WriteAllLines($fullPath, [string[]]$lines, $utf8WithBom)
 }
 
-# ── embedded HTML ─────────────────────────────────────────────────────────────
+function Get-RetryAfterSecond {
+    # Retry-After from the error response, otherwise exponential backoff.
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
 
-$Html = @'
+        [Parameter(Mandatory)]
+        [int]$Attempt
+    )
+
+    $seconds = $null
+    try {
+        $exception = $ErrorRecord.Exception
+        if ($exception.PSObject.Properties['Response'] -and $exception.Response -and $exception.Response.Headers) {
+            $retryAfter = $exception.Response.Headers.RetryAfter
+            if ($retryAfter -and $retryAfter.Delta) {
+                $seconds = [int][math]::Ceiling($retryAfter.Delta.TotalSeconds)
+            }
+            elseif ($retryAfter -and $retryAfter.Date) {
+                $seconds = [int][math]::Ceiling(($retryAfter.Date - [DateTimeOffset]::UtcNow).TotalSeconds)
+            }
+        }
+    }
+    catch {
+        $seconds = $null
+    }
+    if ($null -eq $seconds) {
+        $seconds = [int][math]::Pow(2, $Attempt)
+    }
+    return [math]::Max(1, [math]::Min($seconds, $MaxRetryAfterSeconds))
+}
+
+function ConvertTo-UtcTimestamp {
+    # Timestamp -> ISO 8601 UTC (2026-11-01T10:00:00Z). Unparseable values are returned unchanged.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value -or [string]$Value -eq '') {
+        return ''
+    }
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Value -is [System.DateTimeOffset]) {
+        $utc = $Value.UtcDateTime
+    }
+    elseif ($Value -is [datetime]) {
+        if ($Value.Kind -eq [System.DateTimeKind]::Unspecified) {
+            $utc = [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc)
+        }
+        else {
+            $utc = $Value.ToUniversalTime()
+        }
+    }
+    else {
+        $parsed = [System.DateTimeOffset]::MinValue
+        $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal
+        if (-not [System.DateTimeOffset]::TryParse([string]$Value, $invariant, $styles, [ref]$parsed)) {
+            return [string]$Value
+        }
+        $utc = $parsed.UtcDateTime
+    }
+    return $utc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $invariant)
+}
+
+function ConvertTo-HtmlSafe {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(ValueFromPipeline)]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    process {
+        if ($null -eq $Value) {
+            return ''
+        }
+        return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+    }
+}
+function Invoke-StaleDevicesGraph {
+    # Invoke-MgGraphRequest with retry on 429 (GET also 503/504). Writes are only retried on 429.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('GET', 'PATCH', 'DELETE')]
+        [string]$Method,
+
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [Parameter()]
+        [string]$Body,
+
+        [Parameter()]
+        [hashtable]$Headers
+    )
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            $request = @{ Method = $Method; Uri = $Uri }
+            if ($Body) {
+                $request['Body'] = $Body
+                $request['ContentType'] = 'application/json'
+            }
+            if ($Headers) {
+                $request['Headers'] = $Headers
+            }
+            return Invoke-MgGraphRequest @request
+        }
+        catch {
+            $status = (Get-GraphErrorDetail -ErrorRecord $_).StatusCode
+            $retryable = ($status -eq 429) -or ($Method -eq 'GET' -and $status -in @(503, 504))
+            if (-not $retryable -or $attempt -gt $MaxRetries) {
+                throw
+            }
+            $wait = Get-RetryAfterSecond -ErrorRecord $_ -Attempt $attempt
+            Write-Verbose "HTTP $status from Graph, retry $attempt of $MaxRetries in $wait s: $Method $Uri"
+            Start-Sleep -Seconds $wait
+        }
+    }
+}
+
+function Get-MgGraphAllPage {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [Parameter()]
+        [hashtable]$Headers
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $nextUri = $Uri
+    while ($nextUri) {
+        $response = Invoke-StaleDevicesGraph -Method GET -Uri $nextUri -Headers $Headers
+        foreach ($item in @($response.value)) {
+            if ($null -ne $item) {
+                $results.Add($item)
+            }
+        }
+        $nextUri = $response.'@odata.nextLink'
+    }
+    return , $results.ToArray()
+}
+
+function ConvertTo-UtcDateTime {
+    # Graph timestamp -> UTC [datetime], or $null.
+    [CmdletBinding()]
+    [OutputType([datetime])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value -or [string]$Value -eq '') {
+        return $null
+    }
+    if ($Value -is [System.DateTimeOffset]) {
+        return $Value.UtcDateTime
+    }
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [System.DateTimeKind]::Unspecified) {
+            return [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc)
+        }
+        return $Value.ToUniversalTime()
+    }
+    $parsed = [System.DateTimeOffset]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if ([System.DateTimeOffset]::TryParse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+        return $parsed.UtcDateTime
+    }
+    return $null
+}
+
+function Get-DeviceOsFamily {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$OperatingSystem
+    )
+
+    $os = ([string]$OperatingSystem).Trim()
+    if ($os -match '^windows') { return 'Windows' }
+    if ($os -match '^(macmdm|macos|mac os|osx)') { return 'macOS' }
+    if ($os -match '^(ios|ipad|iphone)') { return 'iOS' }
+    if ($os -match '^android') { return 'Android' }
+    if ($os -match '^linux') { return 'Linux' }
+    return 'Other'
+}
+
+function Test-AutopilotDevice {
+    # Windows Autopilot devices have a [ZTDID] entry in physicalIds.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$Device
+    )
+
+    if ($null -eq $Device) {
+        return $false
+    }
+    foreach ($id in @($Device.physicalIds)) {
+        if ([string]$id -like '`[ZTDID`]*') {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-DeviceKeyIndex {
+    # deviceIds with BitLocker keys / LAPS passwords. $null = could not be read (Unknown).
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    $index = @{ BitLocker = $null; Laps = $null }
+    if ($SkipKeyCheck) {
+        return $index
+    }
+    try {
+        $keys = Get-MgGraphAllPage -Uri "$GraphBase/informationProtection/bitlocker/recoveryKeys" -Headers $KeyHeaders
+        $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in $keys) { if ($key.deviceId) { [void]$set.Add([string]$key.deviceId) } }
+        $index.BitLocker = $set
+    }
+    catch {
+        Write-Warning "BitLocker keys could not be read (status Unknown, delete blocked without -AllowKeyLoss): $($_.Exception.Message)"
+    }
+    try {
+        $creds = Get-MgGraphAllPage -Uri "$GraphBase/directory/deviceLocalCredentials?`$select=id,deviceName" -Headers $KeyHeaders
+        $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($cred in $creds) { if ($cred.id) { [void]$set.Add([string]$cred.id) } }
+        $index.Laps = $set
+    }
+    catch {
+        Write-Warning "LAPS passwords could not be read (status Unknown, delete blocked without -AllowKeyLoss): $($_.Exception.Message)"
+    }
+    return $index
+}
+
+function Get-KeyStatusFromIndex {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$Set,
+
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$DeviceId
+    )
+
+    if ($null -eq $Set -or -not $DeviceId) {
+        return 'Unknown'
+    }
+    if ($Set.Contains($DeviceId)) {
+        return 'Yes'
+    }
+    return 'No'
+}
+
+function Get-DeviceKeyStatusLive {
+    # Fresh BitLocker / LAPS status for one device (used right before delete).
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$DeviceId
+    )
+
+    $status = @{ BitLocker = 'Unknown'; Laps = 'Unknown' }
+    if ($SkipKeyCheck -or $DeviceId -notmatch $GuidPattern) {
+        return $status
+    }
+    try {
+        $filter = [uri]::EscapeDataString("deviceId eq '$DeviceId'")
+        $keys = Invoke-StaleDevicesGraph -Method GET -Uri "$GraphBase/informationProtection/bitlocker/recoveryKeys?`$filter=$filter" -Headers $KeyHeaders
+        $status.BitLocker = if (@($keys.value | Where-Object { $_ }).Count -gt 0) { 'Yes' } else { 'No' }
+    }
+    catch {
+        Write-Verbose "BitLocker status for $DeviceId unknown: $($_.Exception.Message)"
+    }
+    try {
+        $null = Invoke-StaleDevicesGraph -Method GET -Uri "$GraphBase/directory/deviceLocalCredentials/$DeviceId`?`$select=id" -Headers $KeyHeaders
+        $status.Laps = 'Yes'
+    }
+    catch {
+        if ((Get-GraphErrorDetail -ErrorRecord $_).StatusCode -eq 404) {
+            $status.Laps = 'No'
+        }
+        else {
+            Write-Verbose "LAPS status for $DeviceId unknown: $($_.Exception.Message)"
+        }
+    }
+    return $status
+}
+
+function Get-StaleDeviceAssessment {
+    # Applies all eligibility rules to one Graph device object.
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Device,
+
+        [Parameter()]
+        [string]$BitLocker = 'Unknown',
+
+        [Parameter()]
+        [string]$Laps = 'Unknown'
+    )
+
+    $lastSignIn = ConvertTo-UtcDateTime -Value $Device.approximateLastSignInDateTime
+    $registered = ConvertTo-UtcDateTime -Value $Device.registrationDateTime
+    $trust = [string]$Device.trustType
+    $enabled = ($Device.accountEnabled -ne $false)
+    $autopilot = Test-AutopilotDevice -Device $Device
+    $managed = ($Device.isManaged -eq $true)
+
+    $reference = $null
+    $threshold = $StaleDays
+    $basis = 'last sign-in'
+    if ($lastSignIn) {
+        $reference = $lastSignIn
+    }
+    elseif ($registered) {
+        $reference = $registered
+        $threshold = $NoSignInDays
+        $basis = 'registered, never signed in'
+    }
+
+    $days = $null
+    $isStale = $false
+    $deleteFrom = $null
+    $pastGrace = $false
+    if ($reference) {
+        $days = [int][math]::Floor(($script:Now - $reference).TotalDays)
+        $isStale = ($reference -le $script:Now.AddDays(-$threshold))
+        $deleteFrom = $reference.AddDays($threshold + $GraceDays)
+        $pastGrace = ($script:Now -ge $deleteFrom)
+    }
+
+    $exclusions = @()
+    if ($trust -eq 'ServerAD') {
+        $exclusions += 'Hybrid joined: report only, clean up in on-premises AD'
+    }
+    elseif ($trust -notin @('AzureAD', 'Workplace')) {
+        $exclusions += 'Unknown join type: report only'
+    }
+    if ($autopilot -and -not $IncludeAutopilot) {
+        $exclusions += 'Autopilot device (use -IncludeAutopilot)'
+    }
+    if ($managed -and -not $IncludeIntuneManaged) {
+        $exclusions += 'Intune/MDM managed: retire in Intune first (or use -IncludeIntuneManaged)'
+    }
+    $keyReasons = @()
+    if (-not $AllowKeyLoss) {
+        if ($BitLocker -ne 'No') { $keyReasons += "BitLocker key: $BitLocker" }
+        if ($Laps -ne 'No') { $keyReasons += "LAPS password: $Laps" }
+    }
+
+    $canDisable = $isStale -and $enabled -and $exclusions.Count -eq 0
+    $canDelete = $isStale -and (-not $enabled) -and $pastGrace -and $exclusions.Count -eq 0 -and $keyReasons.Count -eq 0
+    $canForceDelete = [bool]$ForceDelete -and $isStale -and $exclusions.Count -eq 0 -and $keyReasons.Count -eq 0
+    $inactiveText = if ($null -ne $days) { "inactive $days days ($basis)" } else { '' }
+
+    if (-not $reference) {
+        $status = 'Unknown'; $reason = 'No last sign-in or registration date'
+    }
+    elseif (-not $isStale) {
+        $status = 'Active'; $reason = "Not stale: $inactiveText"
+    }
+    elseif ($exclusions.Count -gt 0) {
+        $status = 'Excluded'; $reason = ($exclusions -join '; ')
+    }
+    elseif ($enabled) {
+        $status = 'Stale'; $reason = "Stale, $inactiveText. Disable first."
+    }
+    elseif (-not $pastGrace) {
+        $status = 'GracePeriod'; $reason = "Disabled, $inactiveText. Delete from $($deleteFrom.ToString('yyyy-MM-dd'))."
+    }
+    elseif ($keyReasons.Count -gt 0) {
+        $status = 'DeleteBlocked'; $reason = ($keyReasons -join '; ') + ' (use -AllowKeyLoss)'
+    }
+    else {
+        $status = 'DeleteReady'; $reason = "Disabled, $inactiveText."
+    }
+    if ($status -in @('Stale', 'GracePeriod') -and $keyReasons.Count -gt 0) {
+        $reason += ' Delete blocked: ' + ($keyReasons -join '; ') + '.'
+    }
+
+    $joinLabel = if ($JoinTypeLabels.ContainsKey($trust)) { $JoinTypeLabels[$trust] } elseif ($trust) { $trust } else { 'Unknown' }
+    [PSCustomObject]@{
+        DisplayName            = [string]$Device.displayName
+        Status                 = $status
+        Reason                 = $reason
+        JoinType               = $joinLabel
+        OperatingSystem        = [string]$Device.operatingSystem
+        OperatingSystemVersion = [string]$Device.operatingSystemVersion
+        AccountEnabled         = $Device.accountEnabled
+        LastSignIn             = ConvertTo-UtcTimestamp -Value $lastSignIn
+        Registered             = ConvertTo-UtcTimestamp -Value $registered
+        DaysInactive           = $days
+        DeleteEligibleFrom     = ConvertTo-UtcTimestamp -Value $deleteFrom
+        IsManaged              = $managed
+        Autopilot              = $autopilot
+        BitLocker              = $BitLocker
+        Laps                   = $Laps
+        CanDisable             = [bool]$canDisable
+        CanDelete              = [bool]$canDelete
+        CanForceDelete         = [bool]$canForceDelete
+        DeviceId               = [string]$Device.deviceId
+        ObjectId               = [string]$Device.id
+    }
+}
+
+function Get-StaleDeviceReport {
+    # Reads all devices and key status, applies -JoinType / -OperatingSystem and the rules.
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param()
+
+    $script:Now = [datetime]::UtcNow
+    Write-Information 'Reading devices from Microsoft Graph...'
+    $devices = Get-MgGraphAllPage -Uri "$GraphBase/devices?`$select=$DeviceSelect&`$top=999"
+    $index = Get-DeviceKeyIndex
+    $statusOrder = @{ DeleteReady = 0; DeleteBlocked = 1; GracePeriod = 2; Stale = 3; Excluded = 4; Unknown = 5; Active = 6 }
+    $rows = foreach ($device in $devices) {
+        if ($JoinType -ne 'All' -and [string]$device.trustType -ne $JoinTypeFilter[$JoinType]) {
+            continue
+        }
+        if ($OperatingSystem -ne 'All' -and (Get-DeviceOsFamily -OperatingSystem $device.operatingSystem) -ne $OperatingSystem) {
+            continue
+        }
+        $bitLocker = Get-KeyStatusFromIndex -Set $index.BitLocker -DeviceId $device.deviceId
+        $laps = Get-KeyStatusFromIndex -Set $index.Laps -DeviceId $device.deviceId
+        Get-StaleDeviceAssessment -Device $device -BitLocker $bitLocker -Laps $laps
+    }
+    $sorted = @($rows | Sort-Object -Property @{ Expression = { $statusOrder[$_.Status] } }, @{ Expression = { $_.DaysInactive }; Descending = $true }, DisplayName)
+    return , $sorted
+}
+
+function Write-StaleDeviceAudit {
+    # Appends one row to the audit CSV (created with UTF-8 BOM and header).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Entry
+    )
+
+    if (-not $script:AuditFile) {
+        $path = $AuditPath
+        if (-not $path) {
+            $path = Join-Path -Path (Get-Location).ProviderPath -ChildPath ('StaleDevices-Audit-' + $script:Now.ToString('yyyyMMdd-HHmmss') + 'Z.csv')
+        }
+        $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path)
+        if (-not (Test-Path -LiteralPath $fullPath)) {
+            $header = (($AuditColumns | ForEach-Object { '"' + $_ + '"' }) -join ',') + "`r`n"
+            [System.IO.File]::WriteAllText($fullPath, $header, (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $true))
+        }
+        $script:AuditFile = $fullPath
+        Write-Information "Audit log: $fullPath"
+    }
+    $line = @($Entry | Select-Object -Property $AuditColumns | ConvertTo-CsvSafeRow | ConvertTo-Csv -NoTypeInformation)[1]
+    [System.IO.File]::AppendAllText($script:AuditFile, $line + "`r`n", (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false))
+}
+
+function Invoke-StaleDeviceAction {
+    # Re-reads the device from Graph, re-checks all rules, then disables or deletes it (or simulates).
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$ObjectId,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Disable', 'Delete', 'ForceDelete')]
+        [string]$Action,
+
+        [Parameter(Mandatory)]
+        [string]$Source,
+
+        [Parameter()]
+        [switch]$Simulate,
+
+        [Parameter()]
+        [switch]$Declined
+    )
+
+    $entry = [PSCustomObject]@{
+        TimestampUtc = [datetime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+        Operator     = $script:Tenant.Account
+        TenantId     = $script:Tenant.Id
+        Mode         = $Source
+        Action       = $Action
+        Result       = ''
+        DisplayName  = ''
+        ObjectId     = $ObjectId
+        DeviceId     = ''
+        Detail       = ''
+    }
+    if ($ObjectId -notmatch $GuidPattern) {
+        $entry.Result = 'Blocked'; $entry.Detail = 'Invalid object id.'
+        Write-StaleDeviceAudit -Entry $entry
+        return $entry
+    }
+    if ($Declined) {
+        $entry.Result = 'Declined'; $entry.Detail = 'Not confirmed.'
+        Write-StaleDeviceAudit -Entry $entry
+        return $entry
+    }
+    try {
+        $device = Invoke-StaleDevicesGraph -Method GET -Uri "$GraphBase/devices/$ObjectId`?`$select=$DeviceSelect"
+        $entry.DisplayName = [string]$device.displayName
+        $entry.DeviceId = [string]$device.deviceId
+        $script:Now = [datetime]::UtcNow
+        $keys = @{ BitLocker = 'Unknown'; Laps = 'Unknown' }
+        if ($Action -ne 'Disable') {
+            $keys = Get-DeviceKeyStatusLive -DeviceId $device.deviceId
+        }
+        $check = Get-StaleDeviceAssessment -Device $device -BitLocker $keys.BitLocker -Laps $keys.Laps
+        $allowed = switch ($Action) {
+            'Disable' { $check.CanDisable }
+            'Delete' { $check.CanDelete }
+            'ForceDelete' { $check.CanForceDelete }
+        }
+        if (-not $allowed) {
+            $entry.Result = 'Blocked'
+            $entry.Detail = "Not eligible for $Action now ($($check.Status)): $($check.Reason)"
+        }
+        elseif ($Simulate) {
+            $entry.Result = 'WhatIf'
+            $entry.Detail = "Eligible ($($check.Status)). No change made."
+        }
+        else {
+            if ($Action -eq 'Disable') {
+                $null = Invoke-StaleDevicesGraph -Method PATCH -Uri "$GraphBase/devices/$ObjectId" -Body '{"accountEnabled":false}'
+            }
+            else {
+                $null = Invoke-StaleDevicesGraph -Method DELETE -Uri "$GraphBase/devices/$ObjectId"
+            }
+            $entry.Result = 'Success'
+            $entry.Detail = "$($check.Status): $($check.Reason)"
+        }
+    }
+    catch {
+        $detail = Get-GraphErrorDetail -ErrorRecord $_
+        $failure = Get-StaleDevicesFailure -ErrorRecord $_ -Step 'Actions'
+        if ($detail.StatusCode -eq 404) {
+            $entry.Result = 'Blocked'; $entry.Detail = 'Device not found (already deleted?).'
+        }
+        else {
+            $entry.Result = 'Failed'; $entry.Detail = $failure.Message
+            if ($failure.ExitCode -gt $script:WorstExit) {
+                $script:WorstExit = $failure.ExitCode
+            }
+        }
+    }
+    Write-StaleDeviceAudit -Entry $entry
+    return $entry
+}
+
+function Get-StaleDevicesFailure {
+    # Maps an error to exit code and message.
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Module', 'SignIn', 'Devices', 'Actions', 'Other')]
+        [string]$Step
+    )
+
+    $detail = Get-GraphErrorDetail -ErrorRecord $ErrorRecord
+    $codeParts = @()
+    if ($detail.Code) { $codeParts += "Graph error code: $($detail.Code)" }
+    if ($detail.StatusCode) { $codeParts += "HTTP $($detail.StatusCode)" }
+    $codeText = if ($codeParts.Count -gt 0) { " ($($codeParts -join ', '))" } else { '' }
+    $graphMessage = if ($detail.Message) { $detail.Message } else { $ErrorRecord.Exception.Message }
+    $isPermission = ($Step -notin @('Module', 'Other')) -and (($detail.StatusCode -eq 403) -or ([string]$detail.Code -in @('Authorization_RequestDenied', 'Authentication_RequestDenied', 'accessDenied', 'Forbidden')))
+
+    if ($isPermission) {
+        $need = if ($Step -eq 'Actions') { 'Directory.AccessAsUser.All (app-only: Device.ReadWrite.All) and Cloud Device Administrator (or Intune / Windows 365 Administrator for delete)' } else { 'Device.Read.All' }
+        return [PSCustomObject]@{
+            ExitCode = $ExitCodePermission; ErrorId = 'GraphAccessDenied'
+            Category = [System.Management.Automation.ErrorCategory]::PermissionDenied
+            Message  = "Access denied$codeText. Requires $need. Graph message: $graphMessage"
+        }
+    }
+    if ($Step -eq 'SignIn' -or ($Step -notin @('Module', 'Other') -and $detail.StatusCode -eq 401)) {
+        return [PSCustomObject]@{
+            ExitCode = $ExitCodeSignIn; ErrorId = 'GraphSignInFailed'
+            Category = [System.Management.Automation.ErrorCategory]::AuthenticationError
+            Message  = "Microsoft Graph sign-in or session check failed$codeText. $($ErrorRecord.Exception.Message)"
+        }
+    }
+    return [PSCustomObject]@{
+        ExitCode = $ExitCodeError; ErrorId = 'CleanupStaleDevicesFailed'
+        Category = [System.Management.Automation.ErrorCategory]::NotSpecified
+        Message  = "Failed$codeText. $graphMessage"
+    }
+}
+
+function Get-StaleDevicesSummary {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Rows
+    )
+
+    $parts = foreach ($status in @('DeleteReady', 'DeleteBlocked', 'GracePeriod', 'Stale', 'Excluded', 'Unknown', 'Active')) {
+        $count = @($Rows | Where-Object { $_.Status -eq $status }).Count
+        if ($count -gt 0) { "${status}: $count" }
+    }
+    if (-not $parts) { return 'none' }
+    return ($parts -join ', ')
+}
+
+function Get-StaleDevicesSettingsText {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $flags = @()
+    if ($ForceDelete) { $flags += 'ForceDelete' }
+    if ($IncludeAutopilot) { $flags += 'IncludeAutopilot' }
+    if ($IncludeIntuneManaged) { $flags += 'IncludeIntuneManaged' }
+    if ($AllowKeyLoss) { $flags += 'AllowKeyLoss' }
+    if ($SkipKeyCheck) { $flags += 'SkipKeyCheck' }
+    $flagText = if ($flags.Count -gt 0) { ', ' + ($flags -join ', ') } else { '' }
+    return "StaleDays $StaleDays, GraceDays $GraceDays, NoSignInDays $NoSignInDays, JoinType $JoinType, OS $OperatingSystem$flagText"
+}
+
+function ConvertTo-StaleDevicesHtml {
+    # Static HTML report (no scripts; all values HTML-encoded).
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Rows
+    )
+
+    $sb = [System.Text.StringBuilder]::new()
+    $generated = [datetime]::UtcNow.ToString("yyyy-MM-dd HH:mm 'UTC'", [System.Globalization.CultureInfo]::InvariantCulture)
+    [void]$sb.Append(@"
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Cleanup-StaleDevices</title>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Stale devices - $(ConvertTo-HtmlSafe $script:Tenant.DisplayName)</title>
 <style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#ffffff;--bg2:#f5f5f4;--bg3:#eeede9;
-  --border:rgba(0,0,0,.10);--border2:rgba(0,0,0,.18);
-  --text:#1a1a18;--text2:#5a5a56;--text3:#9a9a95;
-  --radius:8px;--radius-lg:12px;
-  --mono:'Consolas','Menlo',monospace;
-  --accent:#185FA5;--accent-bg:#E6F1FB;
-  --warn:#BA7517;--warn-bg:#FAEEDA;
-  --danger:#A32D2D;--danger-bg:#FCEBEB;--danger-bd:#F09595;
-  --success:#0F6E56;--success-bg:#E1F5EE;
-}
-@media(prefers-color-scheme:dark){:root{
-  --bg:#1c1c1a;--bg2:#252523;--bg3:#2e2e2b;
-  --border:rgba(255,255,255,.10);--border2:rgba(255,255,255,.18);
-  --text:#e8e8e4;--text2:#a0a09a;--text3:#6a6a65;
-  --accent:#85B7EB;--accent-bg:#0C447C;
-  --warn:#FAC775;--warn-bg:#633806;
-  --danger:#F09595;--danger-bg:#501313;--danger-bd:#791F1F;
-  --success:#5DCAA5;--success-bg:#04342C;
-}}
-body{font-family:-apple-system,'Segoe UI',sans-serif;background:var(--bg3);color:var(--text);font-size:14px;line-height:1.5;min-height:100vh;padding:2rem 1rem}
-.shell{max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
-.header{display:flex;align-items:baseline;gap:10px;padding-bottom:4px}
-.header h1{font-size:17px;font-weight:600}
-.header span{font-size:12px;color:var(--text3)}
-.card{background:var(--bg);border:.5px solid var(--border);border-radius:var(--radius-lg);padding:1rem 1.25rem}
-.section-label{font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:10px}
-.field{display:flex;flex-direction:column;gap:4px}
-.field label{font-size:12px;color:var(--text2)}
-input[type=text],input[type=number],select{font-family:inherit;font-size:13px;color:var(--text);background:var(--bg2);border:.5px solid var(--border2);border-radius:var(--radius);padding:7px 10px;width:100%;outline:none;transition:border-color .15s;appearance:none}
-input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 18%,transparent)}
-select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;padding-right:28px;cursor:pointer}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
-.age-row{display:flex;align-items:center;gap:10px;margin-top:2px}
-input[type=range]{flex:1;height:4px;cursor:pointer;accent-color:var(--accent)}
-.age-num-wrap{display:flex;align-items:center;gap:5px}
-.age-num-wrap input{width:64px;text-align:right}
-.age-unit{font-size:12px;color:var(--text2);white-space:nowrap}
-.run-btn{display:inline-flex;align-items:center;gap:7px;font-family:inherit;font-size:13px;font-weight:500;padding:8px 18px;border-radius:var(--radius);border:none;background:var(--accent);color:#fff;cursor:pointer;transition:opacity .15s}
-.run-btn:hover{opacity:.88}
-.run-btn:disabled{opacity:.45;cursor:not-allowed}
-.status-bar{font-size:12px;color:var(--text3);display:flex;align-items:center;gap:7px}
-.spinner{width:13px;height:13px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0;display:none}
-@keyframes spin{to{transform:rotate(360deg)}}
-.connect-row{display:flex;align-items:flex-end;gap:10px}
-.connect-row .field{flex:1}
-.connect-pill{font-size:11px;padding:3px 9px;border-radius:20px;font-weight:500;white-space:nowrap}
-.pill-ok{background:var(--success-bg);color:var(--success)}
-.pill-no{background:var(--danger-bg);color:var(--danger)}
-.pill-readonly{background:var(--warn-bg);color:var(--warn)}
-.role-pill{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg2);color:var(--text2);border:.5px solid var(--border);white-space:nowrap}
-.role-pill.write{background:var(--accent-bg);color:var(--accent);border-color:var(--accent)}
-
-/* results area */
-.results-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px}
-.results-title{font-size:13px;font-weight:500}
-.count-badge{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg2);color:var(--text2);border:.5px solid var(--border)}
-.action-bar{display:flex;gap:6px;flex-wrap:wrap}
-.action-btn{display:inline-flex;align-items:center;gap:5px;font-family:inherit;font-size:12px;padding:5px 11px;border-radius:var(--radius);border:.5px solid var(--border2);background:var(--bg);color:var(--text2);cursor:pointer;transition:background .1s}
-.action-btn:hover{background:var(--bg2)}
-.action-btn.danger{border-color:var(--danger-bd);color:var(--danger)}
-.action-btn.danger:hover{background:var(--danger-bg)}
-.action-btn.warn{border-color:var(--warn);color:var(--warn)}
-.action-btn.warn:hover{background:var(--warn-bg)}
-.action-btn:disabled{opacity:.4;cursor:not-allowed}
-
-/* table */
-.tbl-wrap{overflow-x:auto;border-radius:var(--radius);border:.5px solid var(--border)}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-thead th{background:var(--bg2);padding:7px 10px;text-align:left;font-weight:500;font-size:11.5px;color:var(--text2);white-space:nowrap;border-bottom:.5px solid var(--border);position:sticky;top:0}
-tbody tr{border-bottom:.5px solid var(--border);transition:background .1s}
-tbody tr:last-child{border-bottom:none}
-tbody tr:hover{background:var(--bg2)}
-tbody tr.selected{background:var(--accent-bg)}
-tbody td{padding:7px 10px;color:var(--text);vertical-align:middle}
-.td-check{width:32px;text-align:center}
-input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;cursor:pointer}
-.badge-enabled{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--success-bg);color:var(--success)}
-.badge-disabled{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--danger-bg);color:var(--danger)}
-.stale-age{color:var(--danger);font-weight:500}
-.old-age{color:var(--warn)}
-.empty-state{padding:2rem;text-align:center;color:var(--text3);font-size:13px}
-.confirm-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:100;display:none}
-.confirm-card{background:var(--bg);border:.5px solid var(--border2);border-radius:var(--radius-lg);padding:1.5rem;width:380px;max-width:90vw}
-.confirm-card h2{font-size:15px;font-weight:600;margin-bottom:6px}
-.confirm-card p{font-size:13px;color:var(--text2);margin-bottom:1.25rem;line-height:1.6}
-.confirm-btns{display:flex;gap:8px;justify-content:flex-end}
-.btn-cancel{font-family:inherit;font-size:13px;padding:7px 14px;border-radius:var(--radius);border:.5px solid var(--border2);background:var(--bg);color:var(--text2);cursor:pointer}
-.btn-cancel:hover{background:var(--bg2)}
-.btn-confirm-danger{font-family:inherit;font-size:13px;font-weight:500;padding:7px 14px;border-radius:var(--radius);border:none;background:var(--danger);color:#fff;cursor:pointer}
-.btn-confirm-warn{font-family:inherit;font-size:13px;font-weight:500;padding:7px 14px;border-radius:var(--radius);border:none;background:var(--warn);color:#fff;cursor:pointer}
-.log-list{display:flex;flex-direction:column;gap:3px;max-height:180px;overflow-y:auto;margin-top:10px}
-.log-item{font-size:12px;font-family:var(--mono);padding:4px 8px;border-radius:4px;background:var(--bg2)}
-.log-ok{color:var(--success)}
-.log-err{color:var(--danger)}
-.log-info{color:var(--text2)}
+body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1f2937}
+h1{font-size:20px;margin:0 0 4px}
+.meta,.note{color:#6b7280;font-size:13px}
+.note{background:#fef3c7;border:1px solid #fcd34d;padding:8px 12px;border-radius:6px;color:#78350f;margin:12px 0}
+.cards{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}
+.card{border:1px solid #e5e7eb;border-radius:8px;padding:8px 14px;min-width:110px}
+.card b{display:block;font-size:20px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{border-bottom:1px solid #e5e7eb;padding:5px 6px;text-align:left;vertical-align:top}
+th{background:#f3f4f6;position:sticky;top:0}
 </style>
 </head>
 <body>
-<div class="shell">
-  <div class="header">
-    <h1>Cleanup-StaleDevices</h1>
-    <span>v4</span>
-  </div>
-
-  <!-- Connection status -->
-  <div class="card" id="statusCard">
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <div class="spinner" id="statusSpinner" style="display:block"></div>
-      <span id="statusMsg" style="font-size:13px;color:var(--text2)">Checking connection...</span>
-      <span id="connectPill" class="connect-pill" style="display:none"></span>
-      <span id="permPill" class="connect-pill" style="display:none"></span>
-    </div>
-    <div id="userRow" style="display:none;margin-top:8px">
-      <div style="font-size:12px;color:var(--text2);margin-bottom:4px">
-        <span id="userNameSpan" style="font-weight:500;color:var(--text)"></span>
-        <span id="upnSpan" style="margin-left:5px;color:var(--text3)"></span>
-      </div>
-      <div id="rolesRow" style="display:flex;flex-wrap:wrap;gap:4px"></div>
-    </div>
-  </div>
-
-  <!-- Filters -->
-  <div class="card">
-    <div class="section-label">Device filter</div>
-    <div class="grid3" style="margin-bottom:12px">
-      <div class="field">
-        <label>Join type</label>
-        <select id="joinType">
-          <option value="EntraJoined">Entra joined</option>
-          <option value="HybridJoined">Hybrid joined</option>
-          <option value="Registered">Registered</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Operating system</label>
-        <select id="os">
-          <option value="Windows">Windows</option>
-          <option value="iOS">iOS</option>
-          <option value="Android">Android</option>
-          <option value="MacMDM">macOS MDM</option>
-          <option value="Ipad">iPad</option>
-          <option value="Iphone">iPhone</option>
-          <option value="Unknown">Unknown</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Device scope</label>
-        <select id="scope" onchange="toggleAgeRow()">
-          <option value="stale">Stale devices</option>
-          <option value="disabled">Disabled devices</option>
-        </select>
-      </div>
-    </div>
-    <div id="ageRow" class="field">
-      <label>Inactivity threshold</label>
-      <div class="age-row">
-        <input type="range" id="ageSlider" min="1" max="365" value="90" step="1" oninput="syncAge(this.value,false)" />
-        <div class="age-num-wrap">
-          <input type="number" id="ageNum" min="1" max="5475" value="90" oninput="syncAge(this.value,true)" />
-          <span class="age-unit">days</span>
-        </div>
-      </div>
-    </div>
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px">
-      <div class="status-bar">
-        <div class="spinner" id="querySpinner"></div>
-        <span id="queryStatusMsg"></span>
-      </div>
-      <button class="run-btn" id="queryBtn" onclick="runQuery()" disabled>
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-        Query devices
-      </button>
-    </div>
-  </div>
-
-  <!-- Results -->
-  <div class="card" id="resultsCard" style="display:none">
-    <div class="results-header">
-      <div style="display:flex;align-items:center;gap:8px">
-        <span class="results-title">Results</span>
-        <span class="count-badge" id="countBadge">0 devices</span>
-        <span class="count-badge" id="selBadge" style="display:none">0 selected</span>
-      </div>
-      <div class="action-bar">
-        <button class="action-btn" onclick="selectAll()">Select all</button>
-        <button class="action-btn" onclick="clearSel()">Clear</button>
-        <button class="action-btn warn" id="disableBtn" onclick="confirmAction('disable')" disabled>Disable selected</button>
-        <button class="action-btn danger" id="removeBtn" onclick="confirmAction('remove')" disabled>Remove selected</button>
-        <button class="action-btn" onclick="exportCSV()">Export CSV</button>
-      </div>
-    </div>
-    <div class="tbl-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th class="td-check"><input type="checkbox" id="checkAll" onchange="toggleAll(this.checked)" /></th>
-            <th>Device name</th>
-            <th>OS</th>
-            <th>Version</th>
-            <th>Join type</th>
-            <th>Last sign-in</th>
-            <th>Last check-in date</th>
-            <th>Registered</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody id="tblBody"></tbody>
-      </table>
-    </div>
-    <div class="log-list" id="logList" style="display:none"></div>
-  </div>
-</div>
-
-<!-- Confirm overlay -->
-<div class="confirm-overlay" id="confirmOverlay">
-  <div class="confirm-card">
-    <h2 id="confirmTitle"></h2>
-    <p id="confirmMsg"></p>
-    <div class="confirm-btns">
-      <button class="btn-cancel" onclick="closeConfirm()">Cancel</button>
-      <button id="confirmOkBtn" onclick="executeAction()">Confirm</button>
-    </div>
-  </div>
-</div>
-
-<script>
-let devices = [];
-let pendingAction = null;
-
-// Shared by renderTable() and exportCSV() - returns a Date or null for empty/invalid values
-function parseDate(v) {
-  if (!v) return null;
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-function syncAge(val, fromNum) {
-  const n = Math.max(1, Math.min(5475, parseInt(val) || 1));
-  document.getElementById('ageSlider').value = Math.min(n, 365);
-  document.getElementById('ageNum').value = n;
-}
-
-function toggleAgeRow() {
-  document.getElementById('ageRow').style.display =
-    document.getElementById('scope').value === 'disabled' ? 'none' : '';
-}
-
-function setQueryStatus(msg, spinning) {
-  document.getElementById('queryStatusMsg').textContent = msg;
-  document.getElementById('querySpinner').style.display = spinning ? 'block' : 'none';
-}
-
-let isReadOnly = true;
-
-// Attempt to reach /status up to maxAttempts times with a delay between each.
-// The browser opens before BeginGetContext is ready to accept connections, so
-// a single fire-and-forget call reliably fails on the first try. Retrying with
-// a short back-off gives the listener time to become available without showing
-// a false "not connected" error to the user.
-async function checkStatus(attempt = 1, maxAttempts = 10, delayMs = 800) {
-  // Only network failures are retried. Rendering errors are shown directly so a
-  // JavaScript bug is never mistaken for a connection problem.
-  let d;
-  try {
-    const r = await fetch('/status');
-    d = await r.json();
-  } catch (e) {
-    if (attempt < maxAttempts) {
-      // Listener not ready yet - update the status message with attempt count and retry
-      document.getElementById('statusMsg').textContent =
-        'Connecting... (attempt ' + attempt + ' of ' + maxAttempts + ')';
-      setTimeout(() => checkStatus(attempt + 1, maxAttempts, delayMs), delayMs);
-    } else {
-      // All retries exhausted - show the error
-      document.getElementById('statusSpinner').style.display = 'none';
-      document.getElementById('statusMsg').innerHTML = 'Not connected &mdash; restart the script. (' + e.message + ')';
-      document.getElementById('statusMsg').style.color = 'var(--danger)';
+<h1>Stale devices</h1>
+<div class="meta">Tenant: $(ConvertTo-HtmlSafe $script:Tenant.DisplayName) ($(ConvertTo-HtmlSafe $script:Tenant.Id)) | Generated: $generated | Cleanup-StaleDevices $ScriptVersion</div>
+<div class="meta">Settings: $(ConvertTo-HtmlSafe (Get-StaleDevicesSettingsText))</div>
+<div class="note">This report $(ConvertTo-HtmlSafe $SensitiveReportWarning) Hybrid joined devices are report only. Deleting a device also deletes its BitLocker keys and LAPS password.</div>
+<div class="cards">
+"@)
+    foreach ($status in @('DeleteReady', 'DeleteBlocked', 'GracePeriod', 'Stale', 'Excluded', 'Unknown', 'Active')) {
+        $count = @($Rows | Where-Object { $_.Status -eq $status }).Count
+        [void]$sb.Append("<div class=""card""><b>$count</b>$status</div>")
     }
-    return;
-  }
-  try {
-    // Normalise roles defensively: may arrive as a string, null or an array
-    const roles = Array.isArray(d.roles) ? d.roles : (d.roles ? [d.roles] : []);
-    d.roles = roles;
-    if (d.ok) {
-      // Store read-only flag globally so updateSelectionUI can gate the action buttons
-      isReadOnly = d.readOnly;
-      document.getElementById('statusSpinner').style.display = 'none';
-      document.getElementById('statusMsg').textContent = 'Connected to tenant ' + d.tenant;
-      document.getElementById('statusMsg').style.color = 'var(--success)';
-      const pill = document.getElementById('connectPill');
-      pill.textContent = 'Connected';
-      pill.className = 'connect-pill pill-ok';
-      pill.style.display = '';
-      // Permission indicator - warns the user if write operations are unavailable
-      const perm = document.getElementById('permPill');
-      perm.textContent = isReadOnly ? 'Read-only' : 'Read/Write';
-      perm.className   = 'connect-pill ' + (isReadOnly ? 'pill-readonly' : 'pill-ok');
-      perm.title       = isReadOnly
-        ? 'Your Entra directory role does not include device write permissions. Disable and Remove actions are unavailable.'
-        : 'Your Entra directory role includes device write permissions. All actions available.';
-      perm.style.display = '';
-      // Render signed-in user name, UPN and assigned directory roles
-      document.getElementById('userNameSpan').textContent = d.userName || '';
-      document.getElementById('upnSpan').textContent = d.upn ? '(' + d.upn + ')' : '';
-      const rolesRow = document.getElementById('rolesRow');
-      rolesRow.innerHTML = '';
-      (d.roles || []).forEach(role => {
-        const span = document.createElement('span');
-        span.className = 'role-pill' + (!isReadOnly ? ' write' : '');
-        span.textContent = role;
-        rolesRow.appendChild(span);
-      });
-      if (!d.roles || d.roles.length === 0) {
-        const span = document.createElement('span');
-        span.className = 'role-pill';
-        span.textContent = 'No directory roles assigned';
-        rolesRow.appendChild(span);
-      }
-      document.getElementById('userRow').style.display = '';
-      document.getElementById('queryBtn').disabled = false;
-      // Disable action buttons immediately if read-only; re-evaluated on each selection change
-      if (isReadOnly) {
-        const disableBtn = document.getElementById('disableBtn');
-        const removeBtn  = document.getElementById('removeBtn');
-        disableBtn.disabled = true;
-        disableBtn.title    = 'Unavailable: your Entra directory role does not include device write permissions.';
-        removeBtn.disabled  = true;
-        removeBtn.title     = 'Unavailable: your Entra directory role does not include device write permissions.';
-      }
+    [void]$sb.Append("</div>`n<table>`n<thead><tr>")
+    foreach ($column in $ReportColumns) {
+        [void]$sb.Append('<th>' + (ConvertTo-HtmlSafe $column) + '</th>')
     }
-    else {
-      document.getElementById('statusSpinner').style.display = 'none';
-      document.getElementById('statusMsg').textContent = 'Status check failed: ' + (d.error || 'unknown error');
-      document.getElementById('statusMsg').style.color = 'var(--danger)';
+    [void]$sb.Append("</tr></thead>`n<tbody>`n")
+    foreach ($row in $Rows) {
+        [void]$sb.Append('<tr>')
+        foreach ($column in $ReportColumns) {
+            [void]$sb.Append('<td>' + (ConvertTo-HtmlSafe $row.$column) + '</td>')
+        }
+        [void]$sb.Append("</tr>`n")
     }
-  } catch (e) {
-    // Connected, but the UI failed to render the status - show the real error
-    document.getElementById('statusSpinner').style.display = 'none';
-    document.getElementById('statusMsg').textContent = 'UI error: ' + e.message;
-    document.getElementById('statusMsg').style.color = 'var(--danger)';
-    console.error(e);
-  }
-}
-
-window.addEventListener('load', () => checkStatus());
-
-async function runQuery() {
-  document.getElementById('queryBtn').disabled = true;
-  document.getElementById('resultsCard').style.display = 'none';
-  setQueryStatus('Querying Graph...', true);
-  const body = {
-    joinType:  document.getElementById('joinType').value,
-    os:        document.getElementById('os').value,
-    scope:     document.getElementById('scope').value,
-    age:       parseInt(document.getElementById('ageNum').value) || 90
-  };
-  try {
-    const r = await fetch('/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      targetAddressSpace: 'loopback'
-    });
-    const d = await r.json();
-    if (d.ok) {
-      devices = d.devices;
-      renderTable(devices);
-      setQueryStatus(`Found ${devices.length} device${devices.length !== 1 ? 's' : ''}.`, false);
-    } else {
-      setQueryStatus('Query failed: ' + d.error, false);
+    if ($Rows.Count -eq 0) {
+        [void]$sb.Append("<tr><td colspan=""$($ReportColumns.Count)"">No devices.</td></tr>`n")
     }
-  } catch (e) {
-    setQueryStatus('Query failed: ' + e.message, false);
-  }
-  document.getElementById('queryBtn').disabled = false;
+    [void]$sb.Append("</tbody>`n</table>`n</body>`n</html>`n")
+    return $sb.ToString()
 }
 
-function renderTable(devs) {
-  const tbody = document.getElementById('tblBody');
-  if (!devs.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No devices found.</td></tr>';
-    document.getElementById('countBadge').textContent = '0 devices';
-    document.getElementById('resultsCard').style.display = '';
-    document.getElementById('logList').style.display = 'none';
-    return;
-  }
-  tbody.innerHTML = devs.map((d, i) => {
-    const lastSignIn = parseDate(d.lastSignIn);
-    const registered = parseDate(d.registered);
-    const daysSince  = lastSignIn ? Math.floor((Date.now() - lastSignIn.getTime()) / 86400000) : null;
-    const ageClass   = daysSince === null ? '' : daysSince > 180 ? 'stale-age' : daysSince > 90 ? 'old-age' : '';
-    // ageStr  = relative age e.g. "92d ago", colour-coded by threshold
-    // lastSignInDate = absolute locale date shown in the adjacent "Last check-in date" column
-    const ageStr          = daysSince === null ? '&mdash;' : `<span class="${ageClass}">${daysSince}d ago</span>`;
-    const lastSignInDate  = lastSignIn ? lastSignIn.toLocaleDateString() : '&mdash;';
-    const regStr          = registered ? registered.toLocaleDateString() : '&mdash;';
-    const statusBadge = d.accountEnabled
-      ? '<span class="badge-enabled">Enabled</span>'
-      : '<span class="badge-disabled">Disabled</span>';
-    const jt = { AzureAD: 'Entra joined', ServerAD: 'Hybrid joined', Workplace: 'Registered' };
-    return `<tr id="row-${i}">
-      <td class="td-check"><input type="checkbox" data-idx="${i}" onchange="onRowCheck(${i},this.checked)" /></td>
-      <td style="font-weight:500">${esc(d.displayName)}</td>
-      <td>${esc(d.operatingSystem||'&mdash;')}</td>
-      <td style="color:var(--text2)">${esc(d.operatingSystemVersion||'&mdash;')}</td>
-      <td>${jt[d.trustType]||esc(d.trustType)||'&mdash;'}</td>
-      <td>${ageStr}</td>
-      <td style="color:var(--text2)">${lastSignInDate}</td>
-      <td style="color:var(--text2)">${regStr}</td>
-      <td>${statusBadge}</td>
-    </tr>`;
-  }).join('');
-  document.getElementById('countBadge').textContent = `${devs.length} device${devs.length !== 1 ? 's' : ''}`;
-  document.getElementById('resultsCard').style.display = '';
-  document.getElementById('logList').style.display = 'none';
-  document.getElementById('logList').innerHTML = '';
-  updateSelectionUI();
+function Get-UiSecret {
+    # Random hex string (cryptographic RNG).
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [int]$Bytes = 32
+    )
+
+    $buffer = New-Object -TypeName byte[] -ArgumentList $Bytes
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($buffer) } finally { $rng.Dispose() }
+    return ([System.BitConverter]::ToString($buffer) -replace '-', '').ToLowerInvariant()
 }
 
-function esc(s) {
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function Test-UiTokenEqual {
+    # Constant-time string compare.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Supplied,
+
+        [Parameter(Mandatory)]
+        [string]$Expected
+    )
+
+    if ([string]::IsNullOrEmpty($Supplied) -or $Supplied.Length -ne $Expected.Length) {
+        return $false
+    }
+    $diff = 0
+    for ($i = 0; $i -lt $Expected.Length; $i++) {
+        $diff = $diff -bor ([int][char]$Supplied[$i] -bxor [int][char]$Expected[$i])
+    }
+    return ($diff -eq 0)
 }
 
-function getSelected() {
-  return [...document.querySelectorAll('#tblBody input[type=checkbox]:checked')]
-    .map(cb => parseInt(cb.dataset.idx));
+function Test-UiRequest {
+    # Returns $null if the request may be served, otherwise the reason.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Request,
+
+        [Parameter(Mandatory)]
+        [string]$Token,
+
+        [Parameter(Mandatory)]
+        [int]$UiPort,
+
+        [Parameter()]
+        [switch]$Api
+    )
+
+    if (-not $Request.RemoteIsLoopback) {
+        return 'Remote address is not loopback.'
+    }
+    if ($Request.DuplicateSecurityHeader) {
+        return 'Duplicate Host, Origin or token header.'
+    }
+    $hostHeader = [string]$Request.Headers['Host']
+    if ($hostHeader -notin @("127.0.0.1:$UiPort", "localhost:$UiPort")) {
+        return 'Invalid Host header.'
+    }
+    if (-not $Api) {
+        return $null
+    }
+    if ($Request.Method -ne 'POST') {
+        return 'Only POST is allowed.'
+    }
+    $origin = [string]$Request.Headers['Origin']
+    if ($origin -notin @("http://127.0.0.1:$UiPort", "http://localhost:$UiPort")) {
+        return 'Invalid or missing Origin header.'
+    }
+    $fetchSite = [string]$Request.Headers['Sec-Fetch-Site']
+    if ($fetchSite -and $fetchSite -ne 'same-origin') {
+        return 'Cross-site request.'
+    }
+    if ([string]$Request.Headers['Content-Type'] -notmatch '^application/json\s*(;|$)') {
+        return 'Content-Type must be application/json.'
+    }
+    if (-not (Test-UiTokenEqual -Supplied ([string]$Request.Headers['X-CSRF-Token']) -Expected $Token)) {
+        return 'Invalid CSRF token.'
+    }
+    return $null
 }
 
-function onRowCheck(i, checked) {
-  document.getElementById('row-' + i).classList.toggle('selected', checked);
-  updateSelectionUI();
+function Read-UiHttpRequest {
+    # Minimal HTTP/1.1 request parser (headers max 16 KB, body max 64 KB).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.Sockets.TcpClient]$Client
+    )
+
+    $stream = $Client.GetStream()
+    $stream.ReadTimeout = 5000
+    $buffer = New-Object -TypeName byte[] -ArgumentList 8192
+    $ms = New-Object -TypeName System.IO.MemoryStream
+    $headerEnd = -1
+    while ($headerEnd -lt 0) {
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+        if ($read -le 0) { return $null }
+        $ms.Write($buffer, 0, $read)
+        $text = [System.Text.Encoding]::ASCII.GetString($ms.ToArray())
+        $headerEnd = $text.IndexOf("`r`n`r`n")
+        if ($headerEnd -lt 0 -and $ms.Length -gt 16384) { throw 'Request header too large.' }
+    }
+    $all = $ms.ToArray()
+    $lines = [System.Text.Encoding]::ASCII.GetString($all, 0, $headerEnd) -split "`r`n"
+    $requestLine = $lines[0] -split ' '
+    if ($requestLine.Count -ne 3) { throw 'Bad request line.' }
+    $headers = @{}
+    $duplicate = $false
+    foreach ($line in $lines[1..($lines.Count - 1)]) {
+        $colon = $line.IndexOf(':')
+        if ($colon -le 0) { continue }
+        $name = $line.Substring(0, $colon).Trim()
+        $value = $line.Substring($colon + 1).Trim()
+        if ($headers.ContainsKey($name)) {
+            if ($name -in @('Host', 'Origin', 'X-CSRF-Token', 'Content-Length')) { $duplicate = $true }
+            continue
+        }
+        $headers[$name] = $value
+    }
+    $length = 0
+    if ($headers.ContainsKey('Content-Length') -and -not [int]::TryParse($headers['Content-Length'], [ref]$length)) { throw 'Bad Content-Length.' }
+    if ($length -lt 0 -or $length -gt 65536) { throw 'Request body too large.' }
+    $body = New-Object -TypeName System.IO.MemoryStream
+    $bodyStart = $headerEnd + 4
+    if ($all.Length -gt $bodyStart) { $body.Write($all, $bodyStart, $all.Length - $bodyStart) }
+    while ($body.Length -lt $length) {
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+        if ($read -le 0) { break }
+        $body.Write($buffer, 0, $read)
+    }
+    $remote = $Client.Client.RemoteEndPoint
+    [PSCustomObject]@{
+        Method                  = $requestLine[0]
+        Path                    = ($requestLine[1] -split '\?')[0]
+        Headers                 = $headers
+        Body                    = [System.Text.Encoding]::UTF8.GetString($body.ToArray(), 0, [math]::Min([int]$body.Length, $length))
+        RemoteIsLoopback        = ($remote -is [System.Net.IPEndPoint]) -and [System.Net.IPAddress]::IsLoopback($remote.Address)
+        DuplicateSecurityHeader = $duplicate
+    }
 }
 
-function toggleAll(checked) {
-  document.querySelectorAll('#tblBody input[type=checkbox]').forEach(cb => {
-    cb.checked = checked;
-    const i = parseInt(cb.dataset.idx);
-    document.getElementById('row-' + i).classList.toggle('selected', checked);
-  });
-  updateSelectionUI();
+function Send-UiHttpResponse {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.Sockets.TcpClient]$Client,
+
+        [Parameter(Mandatory)]
+        [int]$Status,
+
+        [Parameter(Mandatory)]
+        [string]$ContentType,
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$Body = '',
+
+        [Parameter()]
+        [string]$Csp = "default-src 'none'; frame-ancestors 'none'"
+    )
+
+    $reasons = @{ 200 = 'OK'; 400 = 'Bad Request'; 403 = 'Forbidden'; 404 = 'Not Found'; 405 = 'Method Not Allowed'; 500 = 'Internal Server Error' }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    $head = "HTTP/1.1 $Status $($reasons[$Status])`r`n" +
+        "Content-Type: $ContentType`r`n" +
+        "Content-Length: $($bytes.Length)`r`n" +
+        "Content-Security-Policy: $Csp`r`n" +
+        "X-Content-Type-Options: nosniff`r`n" +
+        "X-Frame-Options: DENY`r`n" +
+        "Referrer-Policy: no-referrer`r`n" +
+        "Cross-Origin-Resource-Policy: same-origin`r`n" +
+        "Cross-Origin-Opener-Policy: same-origin`r`n" +
+        "Cache-Control: no-store`r`n" +
+        "Connection: close`r`n`r`n"
+    $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+    $stream = $Client.GetStream()
+    $stream.Write($headBytes, 0, $headBytes.Length)
+    if ($bytes.Length -gt 0) { $stream.Write($bytes, 0, $bytes.Length) }
+    $stream.Flush()
+    $Client.Close()
 }
 
-function selectAll() { document.getElementById('checkAll').checked = true; toggleAll(true); }
-function clearSel()  { document.getElementById('checkAll').checked = false; toggleAll(false); }
+function ConvertTo-UiJson {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [object]$InputObject
+    )
 
-function updateSelectionUI() {
-  const sel = getSelected();
-  const n   = sel.length;
-  const sb  = document.getElementById('selBadge');
-  sb.textContent = `${n} selected`;
-  sb.style.display = n ? '' : 'none';
-  // Only enable action buttons when there is a selection AND the session has write permissions
-  document.getElementById('disableBtn').disabled = n === 0 || isReadOnly;
-  document.getElementById('removeBtn').disabled  = n === 0 || isReadOnly;
+    # Escape < > & so JSON can never be sniffed as HTML.
+    $json = $InputObject | ConvertTo-Json -Depth 6 -Compress
+    return $json.Replace('<', '\u003c').Replace('>', '\u003e').Replace('&', '\u0026')
 }
 
-function confirmAction(action) {
-  const sel  = getSelected();
-  const n    = sel.length;
-  pendingAction = action;
-  document.getElementById('confirmTitle').textContent =
-    action === 'disable' ? `Disable ${n} device${n !== 1 ? 's' : ''}?` : `Remove ${n} device${n !== 1 ? 's' : ''}?`;
-  document.getElementById('confirmMsg').textContent =
-    action === 'disable'
-      ? `This will set accountEnabled = false on ${n} device${n !== 1 ? 's' : ''} in Entra ID. This can be undone.`
-      : `This will permanently delete ${n} device${n !== 1 ? 's' : ''} from Entra ID. This cannot be undone.`;
-  const okBtn = document.getElementById('confirmOkBtn');
-  okBtn.className = action === 'disable' ? 'btn-confirm-warn' : 'btn-confirm-danger';
-  okBtn.textContent = action === 'disable' ? 'Disable' : 'Remove';
-  document.getElementById('confirmOverlay').style.display = 'flex';
+function Get-UiState {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    $rows = @($script:UiRows)
+    $script:LoadedDevices = @{}
+    foreach ($row in $rows) { $script:LoadedDevices[$row.ObjectId] = $row }
+    return @{
+        ok          = $true
+        version     = $ScriptVersion
+        tenant      = $script:Tenant.DisplayName
+        tenantId    = $script:Tenant.Id
+        operator    = $script:Tenant.Account
+        settings    = (Get-StaleDevicesSettingsText)
+        whatIf      = [bool]$WhatIfPreference
+        forceDelete = [bool]$ForceDelete
+        maxDevices  = $MaxDevices
+        actionsUsed = $script:ActionCount
+        summary     = (Get-StaleDevicesSummary -Rows $rows)
+        devices     = @($rows | ForEach-Object {
+                @{ objectId = $_.ObjectId; name = $_.DisplayName; status = $_.Status; reason = $_.Reason; joinType = $_.JoinType
+                    os = $_.OperatingSystem; osVersion = $_.OperatingSystemVersion; enabled = $_.AccountEnabled; lastSignIn = $_.LastSignIn
+                    days = $_.DaysInactive; deleteFrom = $_.DeleteEligibleFrom; managed = $_.IsManaged; autopilot = $_.Autopilot
+                    bitLocker = $_.BitLocker; laps = $_.Laps; canDisable = $_.CanDisable; canDelete = $_.CanDelete; canForceDelete = $_.CanForceDelete }
+            })
+    }
 }
 
-function closeConfirm() {
-  document.getElementById('confirmOverlay').style.display = 'none';
-  pendingAction = null;
+function Invoke-UiAction {
+    # Validates an action request from the UI and runs it device by device.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [object]$Body
+    )
+
+    $actionMap = @{ disable = 'Disable'; delete = 'Delete'; forcedelete = 'ForceDelete' }
+    $confirmText = @{ Disable = 'DISABLE'; Delete = 'DELETE'; ForceDelete = 'FORCE DELETE' }
+    $actionKey = [string]$Body.action
+    if (-not $actionMap.ContainsKey($actionKey)) {
+        return @{ status = 400; error = 'Unknown action.' }
+    }
+    $action = $actionMap[$actionKey]
+    if ($action -eq 'ForceDelete' -and -not $ForceDelete) {
+        return @{ status = 403; error = 'Force delete is not enabled. Start the script with -ForceDelete.' }
+    }
+    if ([string]$Body.confirm -cne $confirmText[$action]) {
+        return @{ status = 400; error = "Confirmation text '$($confirmText[$action])' is required." }
+    }
+    $ids = @($Body.ids)
+    if ($ids.Count -lt 1 -or $ids.Count -gt 20) {
+        return @{ status = 400; error = 'Send 1 to 20 device ids per request.' }
+    }
+    foreach ($id in $ids) {
+        if ($id -isnot [string] -or $id -notmatch $GuidPattern) {
+            return @{ status = 400; error = 'Invalid device id.' }
+        }
+        if (-not $script:LoadedDevices.ContainsKey($id)) {
+            return @{ status = 400; error = 'Device is not in the loaded list. Reload and try again.' }
+        }
+    }
+    if ($script:ActionCount + $ids.Count -gt $MaxDevices) {
+        return @{ status = 400; error = "Limit reached: -MaxDevices $MaxDevices per run ($($script:ActionCount) used)." }
+    }
+    $results = foreach ($id in $ids) {
+        $script:ActionCount++
+        $entry = Invoke-StaleDeviceAction -ObjectId $id -Action $action -Source 'UI' -Simulate:([bool]$WhatIfPreference)
+        Write-Information "[UI $action] $($entry.Result) $($entry.DisplayName) - $($entry.Detail)"
+        @{ objectId = $entry.ObjectId; name = $entry.DisplayName; result = $entry.Result; detail = $entry.Detail }
+    }
+    return @{ status = 200; ok = $true; results = @($results); actionsUsed = $script:ActionCount }
 }
 
-async function executeAction() {
-  const action = pendingAction;
-  closeConfirm();
-  const sel     = getSelected();
-  const targets = sel.map(i => devices[i]);
-  const logList = document.getElementById('logList');
-  logList.style.display = 'flex';
-  logList.innerHTML = `<div class="log-item log-info">Starting ${action} on ${targets.length} device(s)...</div>`;
+function Invoke-UiRequest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.Sockets.TcpClient]$Client
+    )
 
-  document.getElementById('disableBtn').disabled = true;
-  document.getElementById('removeBtn').disabled  = true;
-
-  for (const dev of targets) {
+    $json = 'application/json; charset=utf-8'
+    $request = Read-UiHttpRequest -Client $Client
+    if (-not $request) {
+        $Client.Close()
+        return
+    }
+    if ($request.Method -eq 'GET' -and $request.Path -in @('/', '/index.html')) {
+        $reason = Test-UiRequest -Request $request -Token $script:UiToken -UiPort $Port
+        if ($reason) {
+            Send-UiHttpResponse -Client $Client -Status 403 -ContentType 'text/plain; charset=utf-8' -Body $reason
+            return
+        }
+        $nonce = Get-UiSecret -Bytes 16
+        $csp = "default-src 'none'; script-src 'nonce-$nonce'; style-src 'nonce-$nonce'; connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        $page = $script:UiHtml.Replace('__NONCE__', $nonce).Replace('__TOKEN__', $script:UiToken)
+        Send-UiHttpResponse -Client $Client -Status 200 -ContentType 'text/html; charset=utf-8' -Body $page -Csp $csp
+        return
+    }
+    if (-not $request.Path.StartsWith('/api/')) {
+        Send-UiHttpResponse -Client $Client -Status 404 -ContentType 'text/plain; charset=utf-8' -Body 'Not found'
+        return
+    }
+    if ($request.Method -ne 'POST') {
+        Send-UiHttpResponse -Client $Client -Status 405 -ContentType $json -Body '{"ok":false,"error":"Only POST is allowed."}'
+        return
+    }
+    $reason = Test-UiRequest -Request $request -Token $script:UiToken -UiPort $Port -Api
+    if ($reason) {
+        Write-Warning "UI request rejected: $reason"
+        Send-UiHttpResponse -Client $Client -Status 403 -ContentType $json -Body (ConvertTo-UiJson @{ ok = $false; error = $reason })
+        return
+    }
+    $body = $null
     try {
-      const r = await fetch('/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: action, objectId: dev.objectId, displayName: dev.displayName }),
-        targetAddressSpace: 'loopback'
-      });
-      const d = await r.json();
-      const item = document.createElement('div');
-      item.className = 'log-item ' + (d.ok ? 'log-ok' : 'log-err');
-      item.textContent = d.ok
-        ? '&#10003; ' + dev.displayName
-        : '&#10007; ' + dev.displayName + ' &mdash; ' + d.error;
-      item.innerHTML = item.textContent;
-      logList.appendChild(item);
-      logList.scrollTop = logList.scrollHeight;
-      if (d.ok) {
-        const idx = devices.indexOf(dev);
-        const row = document.getElementById('row-' + idx);
-        if (row) row.style.opacity = '0.4';
-      }
-    } catch (e) {
-      const item = document.createElement('div');
-      item.className = 'log-item log-err';
-      item.innerHTML = '&#10007; ' + dev.displayName + ' &mdash; ' + e.message;
-      logList.appendChild(item);
+        if ($request.Body) { $body = $request.Body | ConvertFrom-Json }
     }
+    catch {
+        Send-UiHttpResponse -Client $Client -Status 400 -ContentType $json -Body '{"ok":false,"error":"Invalid JSON."}'
+        return
+    }
+    try {
+        switch ($request.Path) {
+            '/api/devices' {
+                Send-UiHttpResponse -Client $Client -Status 200 -ContentType $json -Body (ConvertTo-UiJson (Get-UiState))
+            }
+            '/api/reload' {
+                $script:UiRows = Get-UiRow -Rows (Get-StaleDeviceReport)
+                Send-UiHttpResponse -Client $Client -Status 200 -ContentType $json -Body (ConvertTo-UiJson (Get-UiState))
+            }
+            '/api/action' {
+                $result = Invoke-UiAction -Body $body
+                $status = $result.status
+                $result.Remove('status')
+                if (-not $result.ContainsKey('ok')) { $result['ok'] = $false }
+                Send-UiHttpResponse -Client $Client -Status $status -ContentType $json -Body (ConvertTo-UiJson $result)
+            }
+            '/api/stop' {
+                $script:UiRunning = $false
+                Send-UiHttpResponse -Client $Client -Status 200 -ContentType $json -Body '{"ok":true}'
+            }
+            default {
+                Send-UiHttpResponse -Client $Client -Status 404 -ContentType $json -Body '{"ok":false,"error":"Not found."}'
+            }
+        }
+    }
+    catch {
+        $failure = Get-StaleDevicesFailure -ErrorRecord $_ -Step 'Devices'
+        Write-Warning "UI request failed: $($failure.Message)"
+        Send-UiHttpResponse -Client $Client -Status 500 -ContentType $json -Body (ConvertTo-UiJson @{ ok = $false; error = $failure.Message })
+    }
+}
+
+function Get-UiRow {
+    # Rows shown in the UI: all non-active devices (all devices with -IncludeActive).
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Rows
+    )
+
+    return , @($Rows | Where-Object { $IncludeActive -or $_.Status -ne 'Active' })
+}
+
+function Invoke-StaleDevicesUi {
+    # Local web UI on 127.0.0.1 only. Stops with Ctrl+C or the Stop button.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Rows
+    )
+
+    $script:UiToken = Get-UiSecret
+    $script:UiRows = Get-UiRow -Rows $Rows
+    $script:LoadedDevices = @{}
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    try {
+        $listener.Start()
+    }
+    catch {
+        throw "Could not listen on 127.0.0.1:$Port ($($_.Exception.Message)). Use -Port to choose another port."
+    }
+    $url = "http://127.0.0.1:$Port/"
+    $script:UiRunning = $true
+    Write-Information "UI running at $url (this computer only). Stop with Ctrl+C or the Stop button."
+    if ($WhatIfPreference) {
+        Write-Information 'UI runs with -WhatIf: devices are not changed.'
+    }
+    if (-not $NoBrowser) {
+        Start-Process $url
+    }
+    try {
+        while ($script:UiRunning) {
+            if (-not $listener.Pending()) {
+                [System.Threading.Thread]::Sleep(200)
+                continue
+            }
+            $client = $listener.AcceptTcpClient()
+            try {
+                Invoke-UiRequest -Client $client
+            }
+            catch {
+                Write-Verbose "UI connection error: $($_.Exception.Message)"
+                try { Send-UiHttpResponse -Client $client -Status 400 -ContentType 'text/plain; charset=utf-8' -Body 'Bad request' } catch { $client.Close() }
+            }
+        }
+    }
+    finally {
+        $listener.Stop()
+        Write-Information 'UI stopped.'
+    }
+}
+
+$script:UiHtml = @'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<meta name="csrf-token" content="__TOKEN__">
+<title>Cleanup-StaleDevices</title>
+<style nonce="__NONCE__">
+[hidden]{display:none !important}
+body{font-family:Segoe UI,Arial,sans-serif;margin:0;color:#1f2937;background:#f9fafb}
+header{background:#1f2937;color:#fff;padding:12px 20px}
+header h1{font-size:18px;margin:0}
+header .meta{font-size:12px;color:#d1d5db;margin-top:4px}
+main{padding:16px 20px}
+.badge{display:inline-block;background:#f59e0b;color:#111827;border-radius:4px;padding:1px 6px;font-size:12px;margin-left:8px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+select,input,button{font:inherit;font-size:13px;padding:4px 8px}
+button{cursor:pointer;border:1px solid #9ca3af;border-radius:4px;background:#fff}
+button.warn{background:#fef3c7;border-color:#f59e0b}
+button.danger{background:#fee2e2;border-color:#dc2626}
+button:disabled{opacity:.5;cursor:default}
+.msg{font-size:13px;color:#374151;min-height:18px}
+.msg.err{color:#b91c1c}
+.note{background:#fef3c7;border:1px solid #fcd34d;padding:6px 10px;border-radius:6px;font-size:12px;color:#78350f}
+table{border-collapse:collapse;width:100%;font-size:12px;background:#fff}
+th,td{border-bottom:1px solid #e5e7eb;padding:4px 6px;text-align:left;vertical-align:top}
+th{background:#f3f4f6;position:sticky;top:0}
+#log{font-size:12px;max-height:180px;overflow:auto;background:#fff;border:1px solid #e5e7eb;padding:6px;margin-top:8px}
+.ok{color:#047857}.bad{color:#b91c1c}.info{color:#374151}
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center}
+#dialog{background:#fff;padding:18px;border-radius:8px;max-width:520px}
+</style>
+</head>
+<body>
+<header>
+<h1>Cleanup-StaleDevices <span id="whatif" class="badge" hidden>WhatIf: no changes</span></h1>
+<div class="meta">Tenant: <span id="tenant"></span> | Signed in: <span id="operator"></span></div>
+<div class="meta">Settings: <span id="settings"></span></div>
+</header>
+<main>
+<div class="note">Disable is reversible. Delete cannot be undone and removes BitLocker keys and LAPS passwords. Hybrid joined devices are report only. Every rule is checked again before a device is changed.</div>
+<div class="bar">
+<select id="fStatus"><option value="*">All statuses</option></select>
+<select id="fJoin"><option value="*">All join types</option></select>
+<select id="fOs"><option value="*">All OS</option></select>
+<input id="fSearch" type="search" placeholder="Search name or reason">
+<button id="reloadBtn" type="button">Reload</button>
+<button id="stopBtn" type="button">Stop UI</button>
+</div>
+<div class="bar">
+<button id="selAllBtn" type="button">Select shown</button>
+<button id="selNoneBtn" type="button">Clear selection</button>
+<button id="disableBtn" type="button" class="warn">Disable selected</button>
+<button id="deleteBtn" type="button" class="danger">Delete selected</button>
+<button id="forceBtn" type="button" class="danger" hidden>Force delete selected</button>
+<span id="selCount" class="msg"></span>
+</div>
+<div class="msg">Summary: <span id="summary"></span> | <span id="limit"></span> | <span id="shown"></span></div>
+<div id="status" class="msg"></div>
+<table>
+<thead><tr><th></th><th>Name</th><th>Status</th><th>Reason</th><th>Join type</th><th>OS</th><th>Enabled</th><th>Last sign-in (UTC)</th><th>Days</th><th>Delete from (UTC)</th><th>Managed</th><th>Autopilot</th><th>BitLocker</th><th>LAPS</th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+<div id="log" hidden></div>
+</main>
+<div id="overlay" hidden>
+<div id="dialog">
+<h2 id="dlgTitle"></h2>
+<p id="dlgText"></p>
+<p>Type <b id="dlgWord"></b> to confirm:</p>
+<input id="dlgInput" type="text" autocomplete="off">
+<div class="bar"><button id="dlgCancel" type="button">Cancel</button><button id="dlgOk" type="button" class="danger" disabled>Confirm</button></div>
+</div>
+</div>
+<script nonce="__NONCE__">
+(function () {
+  'use strict';
+  var token = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+  var state = null, selected = {}, pending = null, maxRows = 2000;
+  var words = { disable: 'DISABLE', 'delete': 'DELETE', forcedelete: 'FORCE DELETE' };
+  var flags = { disable: 'canDisable', 'delete': 'canDelete', forcedelete: 'canForceDelete' };
+  function el(id) { return document.getElementById(id); }
+  function setText(node, value) { node.textContent = (value === null || value === undefined) ? '' : String(value); return node; }
+  function yesNo(v) { return v === true ? 'Yes' : (v === false ? 'No' : ''); }
+  function setStatus(msg, isError) { setText(el('status'), msg); el('status').className = isError ? 'msg err' : 'msg'; }
+  function api(path, body) {
+    return fetch(path, { method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token }, body: JSON.stringify(body || {}) })
+      .then(function (r) { return r.json().then(function (d) { if (!r.ok) { d.ok = false; } return d; }); });
   }
-
-  const done = document.createElement('div');
-  done.className = 'log-item log-info';
-  done.textContent = 'Done.';
-  logList.appendChild(done);
-  updateSelectionUI();
-}
-
-function exportCSV() {
-  if (!devices.length) return;
-  const headers = ['DisplayName','DeviceId','OS','Version','JoinType','LastSignIn','LastSignInDate','Registered','AccountEnabled'];
-  const rows = devices.map(d => [
-    d.displayName, d.deviceId, d.operatingSystem, d.operatingSystemVersion,
-    d.trustType, d.lastSignIn||'', (parseDate(d.lastSignIn) ? parseDate(d.lastSignIn).toLocaleDateString() : ''), d.registered||'', d.accountEnabled
-  // ?? keeps false (AccountEnabled) instead of turning it into an empty string
-  ].map(v => `"${String(v ?? '').replace(/"/g,'""')}"`).join(','));
-  // UTF-8 BOM so Excel opens Danish characters (æ, ø, å) in device names correctly
-  const csv  = '﻿' + [headers.join(','), ...rows].join('\r\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href = url; a.download = `StaleDevices_${new Date().toISOString().slice(0,10)}.csv`;
-  // Anchor must be in the DOM for some browsers, and revoking the URL immediately
-  // can cancel the download before it starts - so clean up after a short delay
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
-}
+  function load(path) {
+    setStatus('Loading devices...');
+    return api(path, {}).then(function (d) {
+      if (!d.ok) { setStatus(d.error || 'Error', true); return; }
+      state = d; selected = {}; render(); setStatus('');
+    }).catch(function (e) { setStatus('Request failed: ' + e.message, true); });
+  }
+  function unique(key) {
+    var seen = {}, out = [];
+    state.devices.forEach(function (d) { var v = d[key] || ''; if (!seen[v]) { seen[v] = true; out.push(v); } });
+    return out.sort();
+  }
+  function fill(id, values) {
+    var sel = el(id), cur = sel.value;
+    while (sel.options.length > 1) { sel.remove(1); }
+    values.forEach(function (v) { var o = document.createElement('option'); o.value = v; o.textContent = v === '' ? '(empty)' : v; sel.appendChild(o); });
+    sel.value = values.indexOf(cur) >= 0 ? cur : '*';
+  }
+  function render() {
+    setText(el('tenant'), state.tenant + ' (' + state.tenantId + ')');
+    setText(el('operator'), state.operator);
+    setText(el('settings'), state.settings);
+    setText(el('summary'), state.summary);
+    setText(el('limit'), state.actionsUsed + ' of ' + state.maxDevices + ' device actions used');
+    el('whatif').hidden = !state.whatIf;
+    el('forceBtn').hidden = !state.forceDelete;
+    fill('fStatus', unique('status')); fill('fJoin', unique('joinType')); fill('fOs', unique('os'));
+    renderRows();
+  }
+  function matches(d) {
+    var s = el('fStatus').value, j = el('fJoin').value, o = el('fOs').value, q = el('fSearch').value.toLowerCase();
+    if (s !== '*' && d.status !== s) { return false; }
+    if (j !== '*' && (d.joinType || '') !== j) { return false; }
+    if (o !== '*' && (d.os || '') !== o) { return false; }
+    if (q && ((d.name || '') + ' ' + (d.reason || '')).toLowerCase().indexOf(q) < 0) { return false; }
+    return true;
+  }
+  function shownDevices() { return state ? state.devices.filter(matches) : []; }
+  function renderRows() {
+    var tbody = el('rows');
+    while (tbody.firstChild) { tbody.removeChild(tbody.firstChild); }
+    var list = shownDevices();
+    list.slice(0, maxRows).forEach(function (d) {
+      var tr = document.createElement('tr');
+      var td = document.createElement('td');
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.disabled = !(d.canDisable || d.canDelete || d.canForceDelete);
+      cb.checked = !!selected[d.objectId];
+      cb.addEventListener('change', function () { if (cb.checked) { selected[d.objectId] = d; } else { delete selected[d.objectId]; } updateSel(); });
+      td.appendChild(cb); tr.appendChild(td);
+      [d.name, d.status, d.reason, d.joinType, d.os + (d.osVersion ? ' ' + d.osVersion : ''), yesNo(d.enabled), d.lastSignIn, d.days,
+        d.deleteFrom, yesNo(d.managed), yesNo(d.autopilot), d.bitLocker, d.laps].forEach(function (v) {
+        tr.appendChild(setText(document.createElement('td'), v));
+      });
+      tbody.appendChild(tr);
+    });
+    setText(el('shown'), list.length > maxRows ? ('first ' + maxRows + ' of ' + list.length + ' shown (use filters)') : (list.length + ' shown'));
+    updateSel();
+  }
+  function selectedFor(action) {
+    return Object.keys(selected).map(function (k) { return selected[k]; }).filter(function (d) { return d[flags[action]]; });
+  }
+  function updateSel() {
+    var n = Object.keys(selected).length;
+    setText(el('selCount'), n + ' selected');
+    el('disableBtn').disabled = selectedFor('disable').length === 0;
+    el('deleteBtn').disabled = selectedFor('delete').length === 0;
+    el('forceBtn').disabled = selectedFor('forcedelete').length === 0;
+  }
+  function openConfirm(action) {
+    var list = selectedFor(action);
+    if (!list.length) { setStatus('None of the selected devices can be used for this action.', true); return; }
+    pending = { action: action, ids: list.map(function (d) { return d.objectId; }) };
+    var verb = action === 'disable' ? 'Disable' : (action === 'delete' ? 'Delete' : 'Force delete');
+    setText(el('dlgTitle'), verb + ' ' + list.length + ' device(s)?');
+    setText(el('dlgText'), action === 'disable'
+      ? 'Sets accountEnabled = false. This can be undone.'
+      : 'Permanently deletes the devices from Entra ID, including BitLocker keys and LAPS passwords. This cannot be undone.'
+        + (action === 'forcedelete' ? ' Force delete skips the grace period and also deletes enabled devices.' : ''));
+    setText(el('dlgWord'), words[action]);
+    el('dlgInput').value = '';
+    el('dlgOk').disabled = true;
+    el('overlay').hidden = false;
+    el('dlgInput').focus();
+  }
+  function closeConfirm() { el('overlay').hidden = true; }
+  function logLine(text, cls) {
+    var div = document.createElement('div'); div.className = cls; setText(div, text);
+    el('log').appendChild(div); el('log').hidden = false; el('log').scrollTop = el('log').scrollHeight;
+  }
+  function runAction() {
+    var job = pending; pending = null; closeConfirm();
+    if (!job) { return; }
+    var chunks = [];
+    for (var i = 0; i < job.ids.length; i += 20) { chunks.push(job.ids.slice(i, i + 20)); }
+    logLine('Starting ' + job.action + ' on ' + job.ids.length + ' device(s)...', 'info');
+    var p = Promise.resolve(true);
+    chunks.forEach(function (ids) {
+      p = p.then(function (go) {
+        if (!go) { return false; }
+        return api('/api/action', { action: job.action, ids: ids, confirm: words[job.action] }).then(function (d) {
+          if (!d.ok) { logLine('Stopped: ' + (d.error || 'error'), 'bad'); return false; }
+          d.results.forEach(function (r) {
+            logLine(r.result + ': ' + (r.name || r.objectId) + (r.detail ? ' - ' + r.detail : ''), r.result === 'Success' || r.result === 'WhatIf' ? 'ok' : 'bad');
+          });
+          return true;
+        });
+      });
+    });
+    p.then(function () { logLine('Done. Reloading...', 'info'); return load('/api/reload'); })
+     .catch(function (e) { logLine('Request failed: ' + e.message, 'bad'); });
+  }
+  ['fStatus', 'fJoin', 'fOs'].forEach(function (id) { el(id).addEventListener('change', renderRows); });
+  var timer = null;
+  el('fSearch').addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(renderRows, 200); });
+  el('reloadBtn').addEventListener('click', function () { load('/api/reload'); });
+  el('stopBtn').addEventListener('click', function () { api('/api/stop', {}).then(function () { setStatus('UI stopped. You can close this tab.'); }); });
+  el('selAllBtn').addEventListener('click', function () { shownDevices().slice(0, maxRows).forEach(function (d) { if (d.canDisable || d.canDelete || d.canForceDelete) { selected[d.objectId] = d; } }); renderRows(); });
+  el('selNoneBtn').addEventListener('click', function () { selected = {}; renderRows(); });
+  el('disableBtn').addEventListener('click', function () { openConfirm('disable'); });
+  el('deleteBtn').addEventListener('click', function () { openConfirm('delete'); });
+  el('forceBtn').addEventListener('click', function () { openConfirm('forcedelete'); });
+  el('dlgCancel').addEventListener('click', function () { pending = null; closeConfirm(); });
+  el('dlgInput').addEventListener('input', function () { el('dlgOk').disabled = !pending || el('dlgInput').value !== words[pending.action]; });
+  el('dlgOk').addEventListener('click', runAction);
+  load('/api/devices');
+})();
 </script>
 </body>
 </html>
 '@
 
-# ── Connect to Graph before starting the listener ─────────────────────────────
-# Connect-MgGraph opens an interactive browser auth flow which blocks the thread.
-# It must complete before the HttpListener loop starts, otherwise the listener
-# cannot accept requests while waiting for the auth to finish.
-
-Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
-Write-Host "A browser window will open for authentication." -ForegroundColor Gray
-
-$ConnectedTenantId = $null
-$ConnectedDomain   = $null
-$ReadOnly          = $true
+$exitCode = $ExitCodeSuccess
+$step = 'Module'
+$actionResults = [System.Collections.Generic.List[object]]::new()
 try {
-    $ExistingCtx = Get-MgContext
-    if ($ExistingCtx -and ($ExistingCtx.Scopes -contains "Device.ReadWrite.All")) {
-        Write-Host "Reusing existing Graph session for tenant $($ExistingCtx.TenantId)." -ForegroundColor Green
-        $ConnectedTenantId = $ExistingCtx.TenantId
+    Write-Verbose "Cleanup-StaleDevices version $ScriptVersion"
+    if (-not (Get-Command -Name Connect-MgGraph -ErrorAction SilentlyContinue) -or -not (Get-Command -Name Invoke-MgGraphRequest -ErrorAction SilentlyContinue)) {
+        throw 'Microsoft.Graph.Authentication is not installed. Run: Install-Module Microsoft.Graph.Authentication -Scope CurrentUser'
     }
-    else {
-        Connect-MgGraph -Scopes "Device.ReadWrite.All" -NoWelcome -ErrorAction Stop
-        $ConnectedTenantId = (Get-MgContext).TenantId
-        Write-Host "Connected to tenant $ConnectedTenantId." -ForegroundColor Green
+
+    $step = 'SignIn'
+    $script:Tenant = Connect-StaleDevicesGraph -RequiredScopes $RequiredScopes -TenantId $TenantId -UseWAM:$UseWAM
+    Write-Information "Mode: $Mode. $(Get-StaleDevicesSettingsText)"
+    if ($WhatIfPreference) {
+        Write-Information '-WhatIf: no devices are changed.'
     }
-    # Determine write permission by checking the signed-in user's transitive directory
-    # role assignments rather than the OAuth scope. Device.ReadWrite.All is a delegated
-    # scope granted to the app - it does not reflect the user's Entra role. A Global
-    # Reader will be granted the scope but cannot write; the role check is authoritative.
-    #
-    # Roles that include device write permissions (displayName -> roleDefinitionId):
-    #   Cloud Device Administrator  : 7698a772-787b-4ac8-901f-60d6b08affd2
-    #   Intune Administrator        : 3a2c62db-5318-420d-8d74-23affee5d9d5
-    #   Windows 365 Administrator   : 11451d60-acb2-45eb-a7d6-43d0f0125c13
-    #   Global Administrator        : 62e90394-69f5-4237-9190-012177145e10
-    #   Privileged Role Administrator: e8611ab8-c189-46e8-94e1-60213ab1f814
-    $DeviceWriteRoleIds = @(
-        "7698a772-787b-4ac8-901f-60d6b08affd2",  # Cloud Device Administrator
-        "3a2c62db-5318-420d-8d74-23affee5d9d5",  # Intune Administrator
-        "11451d60-acb2-45eb-a7d6-43d0f0125c13",  # Windows 365 Administrator
-        "62e90394-69f5-4237-9190-012177145e10",  # Global Administrator
-        "e8611ab8-c189-46e8-94e1-60213ab1f814"   # Privileged Role Administrator
-    )
-    $Me = Invoke-MgGraphRequest -Method Get -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,displayName,userPrincipalName" -ErrorAction Stop
-    $ConnectedUserName = $Me.displayName
-    $ConnectedUPN      = $Me.userPrincipalName
-    $RoleResponse = Invoke-MgGraphRequest -Method Get `
-        -Uri "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.directoryRole?`$select=displayName,roleTemplateId" `
-        -ErrorAction Stop
-    $AssignedRoles           = $RoleResponse.value
-    $AssignedRoleTemplateIds = $AssignedRoles | ForEach-Object { $_.roleTemplateId }
-    $AssignedRoleNames       = $AssignedRoles | ForEach-Object { $_.displayName } | Sort-Object
-    $ReadOnly = -not ($AssignedRoleTemplateIds | Where-Object { $DeviceWriteRoleIds -contains $_ })
-    $PermissionLabel = if ($ReadOnly) { "Read-only" } else { "Read/Write" }
-    Write-Host "Signed in as: $ConnectedUserName ($ConnectedUPN)" -ForegroundColor Green
-    Write-Host "Roles: $($AssignedRoleNames -join ', ')" -ForegroundColor Green
-    Write-Host "Permission level: $PermissionLabel" -ForegroundColor $(if ($ReadOnly) { "Yellow" } else { "Green" })
-    # Resolve primary domain from the organization object
-    $OrgResponse = Invoke-MgGraphRequest -Method Get -Uri "https://graph.microsoft.com/v1.0/organization?`$select=verifiedDomains" -ErrorAction Stop
-    $ConnectedDomain = ($OrgResponse.value[0].verifiedDomains | Where-Object { $_.isDefault -eq $true }).name
-    if (-not $ConnectedDomain) { $ConnectedDomain = $ConnectedTenantId }
-    Write-Host "Primary domain: $ConnectedDomain" -ForegroundColor Green
+
+    $step = 'Devices'
+    $allRows = Get-StaleDeviceReport
+    Write-Information "$($allRows.Count) device(s) match the filters. $(Get-StaleDevicesSummary -Rows $allRows)"
+    if (@($allRows | Where-Object { $_.BitLocker -eq 'Unknown' -or $_.Laps -eq 'Unknown' }).Count -gt 0 -and -not $AllowKeyLoss) {
+        Write-Warning 'BitLocker/LAPS status is Unknown for some devices. Delete is blocked for those devices unless -AllowKeyLoss is used.'
+    }
+    $report = @($allRows | Where-Object { $IncludeActive -or $_.Status -ne 'Active' })
+
+    if ($OutputPath) {
+        Export-StaleDevicesCsv -Report $report -Path $OutputPath -Columns $ReportColumns
+        Write-Information "CSV report exported to $OutputPath"
+        Write-Warning "The CSV report $OutputPath $SensitiveReportWarning"
+    }
+    if ($HtmlPath) {
+        $htmlFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($HtmlPath)
+        [System.IO.File]::WriteAllText($htmlFull, (ConvertTo-StaleDevicesHtml -Rows $report), (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $true))
+        Write-Information "HTML report exported to $HtmlPath"
+        Write-Warning "The HTML report $HtmlPath $SensitiveReportWarning"
+    }
+
+    $step = 'Actions'
+    if ($Mode -in @('Disable', 'Delete')) {
+        $targets = @()
+        if ($Mode -eq 'Disable') {
+            $targets = @($allRows | Where-Object { $_.CanDisable } | ForEach-Object { [PSCustomObject]@{ Row = $_; Action = 'Disable' } })
+        }
+        else {
+            $targets = @($allRows | Where-Object { $_.CanDelete -or $_.CanForceDelete } | ForEach-Object {
+                    $action = if ($_.CanDelete) { 'Delete' } else { 'ForceDelete' }
+                    [PSCustomObject]@{ Row = $_; Action = $action }
+                })
+        }
+        Write-Information "$($targets.Count) device(s) eligible for $Mode."
+        if ($targets.Count -gt $MaxDevices) {
+            throw "$($targets.Count) devices are eligible, more than -MaxDevices $MaxDevices. No devices have been changed. Narrow the filters or raise -MaxDevices."
+        }
+        $operations = @{
+            Disable     = 'Disable device'
+            Delete      = 'Delete device (cannot be undone)'
+            ForceDelete = 'FORCE delete device: skips grace period / enabled check (cannot be undone)'
+        }
+        foreach ($target in $targets) {
+            $row = $target.Row
+            $label = "$($row.DisplayName) ($($row.ObjectId))"
+            if ($PSCmdlet.ShouldProcess($label, $operations[$target.Action])) {
+                $entry = Invoke-StaleDeviceAction -ObjectId $row.ObjectId -Action $target.Action -Source $Mode
+            }
+            elseif ($WhatIfPreference) {
+                $entry = Invoke-StaleDeviceAction -ObjectId $row.ObjectId -Action $target.Action -Source $Mode -Simulate
+            }
+            else {
+                $entry = Invoke-StaleDeviceAction -ObjectId $row.ObjectId -Action $target.Action -Source $Mode -Declined
+            }
+            $actionResults.Add($entry)
+            Write-Information "[$($entry.Action)] $($entry.Result) $label - $($entry.Detail)"
+            if ($entry.Result -eq 'Failed' -and $script:WorstExit -eq $ExitCodePermission) {
+                Write-Warning 'Access denied: stopping. Remaining devices were not processed.'
+                break
+            }
+        }
+        $resultSummary = foreach ($result in @('Success', 'WhatIf', 'Blocked', 'Declined', 'Failed')) {
+            $count = @($actionResults | Where-Object { $_.Result -eq $result }).Count
+            if ($count -gt 0) { "${result}: $count" }
+        }
+        $resultText = if ($resultSummary) { $resultSummary -join ', ' } else { 'no devices' }
+        Write-Information "Done. $resultText"
+        if (@($actionResults | Where-Object { $_.Result -eq 'Failed' }).Count -gt 0 -and $script:WorstExit -eq $ExitCodeSuccess) {
+            $script:WorstExit = $ExitCodeError
+        }
+        if ($PassThru -or (-not $OutputPath -and -not $HtmlPath)) {
+            Write-Output $actionResults.ToArray()
+        }
+    }
+    elseif ($Mode -eq 'UI') {
+        Invoke-StaleDevicesUi -Rows $allRows
+    }
+    elseif ($PassThru -or (-not $OutputPath -and -not $HtmlPath)) {
+        Write-Output $report
+    }
 }
 catch {
-    Write-Error "Graph connection failed: $($_.Exception.Message)"
-    exit 1
-}
-
-# ── HTTP listener ─────────────────────────────────────────────────────────────
-# GetContext() blocks the thread permanently, so Ctrl+C can never land.
-# BeginGetContext() + WaitOne(500) polls every 500 ms, keeping the thread
-# responsive to interrupts while still processing every incoming request.
-
-function Invoke-RequestHandler {
-    param($ctx)
-    $req  = $ctx.Request
-    $path = $req.Url.AbsolutePath
-
-    if ($path -eq "/" -or $path -eq "/index.html") {
-        Write-HtmlResponse -Context $ctx -Html $Html
-        return
-    }
-
-    # Edge 143+ sends an OPTIONS preflight before every fetch() to a loopback address.
-    # The preflight must receive Access-Control-Allow-Private-Network: true or Edge
-    # blocks the actual request before it is ever sent.
-    if ($req.HttpMethod -eq "OPTIONS") {
-        $ctx.Response.StatusCode = 204
-        $ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*")
-        $ctx.Response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        $ctx.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type")
-        $ctx.Response.Headers.Add("Access-Control-Allow-Private-Network", "true")
-        $ctx.Response.Close()
-        return
-    }
-
-    $Body = $null
-    if ($req.HasEntityBody) {
-        $Reader = [System.IO.StreamReader]::new($req.InputStream, $req.ContentEncoding)
-        $Body   = $Reader.ReadToEnd() | ConvertFrom-Json
-        $Reader.Close()
-    }
-
-    switch ($path) {
-
-        "/status" {
-            # @() forces an array - with a single role the pipeline returns a plain string,
-            # which ConvertTo-Json emits as "roles":"Global Reader" and breaks forEach in JS
-            Write-JsonResponse -Context $ctx -Body @{ ok = $true; tenant = $ConnectedDomain; readOnly = [bool]$ReadOnly; userName = $ConnectedUserName; upn = $ConnectedUPN; roles = @($AssignedRoleNames) }
-        }
-
-        "/query" {
-            try {
-                $JoinType = $JoinTypeMap[$Body.joinType]
-                if (-not $JoinType) { throw "Unknown join type: $($Body.joinType)" }
-                $Params = @{ JoinType = $JoinType; OS = $Body.os }
-                if ($Body.scope -eq "disabled") { $Params.DisabledDevices = $true }
-                else { $Params.Age = [int]$Body.age }
-                $Result = Get-StaleDevices @Params
-                # Filter nulls - @($null) is a one-element array and would send [null] to the browser
-                Write-JsonResponse -Context $ctx -Body @{ ok = $true; devices = @($Result | Where-Object { $_ }) }
-            }
-            catch {
-                Write-JsonResponse -Context $ctx -Body @{ ok = $false; error = $_.Exception.Message }
-            }
-        }
-
-        "/action" {
-            try {
-                $ObjectId = $Body.objectId
-                $Action   = $Body.action
-                if ($Action -eq "disable") {
-                    Invoke-MgGraphRequestWithRetry -Method Patch `
-                        -Uri "https://graph.microsoft.com/v1.0/devices/$ObjectId" `
-                        -Body @{ accountEnabled = $false }
-                }
-                elseif ($Action -eq "remove") {
-                    Invoke-MgGraphRequestWithRetry -Method Delete `
-                        -Uri "https://graph.microsoft.com/v1.0/devices/$ObjectId"
-                }
-                else { throw "Unknown action: $Action" }
-                Write-JsonResponse -Context $ctx -Body @{ ok = $true }
-            }
-            catch {
-                Write-JsonResponse -Context $ctx -Body @{ ok = $false; error = $_.Exception.Message }
-            }
-        }
-
-        default {
-            $ctx.Response.StatusCode = 404
-            $ctx.Response.Close()
-        }
-    }
-}
-
-# Use the "localhost" prefix. http.sys lets non-admin users register localhost
-# prefixes, and it answers on both IPv4 (127.0.0.1) and IPv6 (::1) loopback.
-# An IP-literal prefix such as http://127.0.0.1/ requires elevation or a
-# netsh URL ACL reservation, so it is deliberately not used.
-$BaseUrl  = "http://localhost:$Port/"
-$Listener = [System.Net.HttpListener]::new()
-$Listener.Prefixes.Add($BaseUrl)
-try {
-    $Listener.Start()
-}
-catch {
-    Write-Error ("Could not start the HTTP listener on port $Port`: $($_.Exception.Message)`n" +
-        "Port $Port may be in use by another process. " +
-        "Check with: netstat -ano | findstr :$Port  - or run the script with -Port <another port>.")
-    exit 1
-}
-
-# Brief pause so the listener is fully accepting connections before the
-# browser sends its first request (avoids a spurious first-attempt failure).
-Start-Sleep -Milliseconds 300
-
-Write-Host "UI running at $BaseUrl" -ForegroundColor Cyan
-Write-Host "Press Ctrl+C to stop." -ForegroundColor Gray
-Start-Process $BaseUrl
-
-try {
-    while ($Listener.IsListening) {
-        $Async = $Listener.BeginGetContext($null, $null)
-        # Poll every 500 ms so Ctrl+C is never blocked longer than half a second
-        while (-not $Async.AsyncWaitHandle.WaitOne(500)) {
-            if (-not $Listener.IsListening) { break }
-        }
-        if (-not $Listener.IsListening) { break }
-        $ctx = $Listener.EndGetContext($Async)
-        Invoke-RequestHandler -ctx $ctx
-    }
+    $failure = Get-StaleDevicesFailure -ErrorRecord $_ -Step $step
+    $exitCode = $failure.ExitCode
+    Write-Error -Message $failure.Message -Category $failure.Category -ErrorId $failure.ErrorId -ErrorAction Continue
 }
 finally {
-    $Listener.Stop()
-    Write-Host "Listener stopped." -ForegroundColor Gray
+    Restore-StaleDevicesWam
 }
+if ($exitCode -eq $ExitCodeSuccess) {
+    $exitCode = $script:WorstExit
+}
+exit $exitCode
