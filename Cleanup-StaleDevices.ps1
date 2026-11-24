@@ -66,7 +66,7 @@
 .EXAMPLE
     .\Cleanup-StaleDevices.ps1 -AuthMode UserRights -TenantId contoso.onmicrosoft.com -Mode Disable -WhatIf
 .NOTES
-    Author : Kasper Johansen, Apento (kmj@apento.com)
+    Author : Kasper Johansen, kasperjohansen.net
     Version: 5.0.0 - 2026-11-24
     Auth modes (no app registration):
       GraphCli (default)  Microsoft Graph Command Line Tools; scopes need admin consent once.
