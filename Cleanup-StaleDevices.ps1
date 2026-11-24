@@ -65,18 +65,18 @@
     .\Cleanup-StaleDevices.ps1 -TenantId contoso.onmicrosoft.com -HtmlPath .\stale.html -OutputPath .\stale.csv
 .EXAMPLE
     .\Cleanup-StaleDevices.ps1 -AuthMode UserRights -TenantId contoso.onmicrosoft.com -Mode Disable -WhatIf
-.EXAMPLE
-    .\Cleanup-StaleDevices.ps1 -Mode Disable -JoinType EntraJoined -OperatingSystem Windows -WhatIf
 .NOTES
-    Kasper Johansen | Apento | kmj@apento.com
-    Version: 5.0.0 (2026-11-24). Rewritten: eligibility rules, key-loss protection, hardened UI, audit, -ReadOnly, -AuthMode.
-    Auth (no app registration): GraphCli = Microsoft Graph Command Line Tools (scopes need admin consent once).
-    -AuthMode UserRights = Azure PowerShell app (preconsented everywhere): access = your Entra roles via
-    Directory.AccessAsUser.All, no admin consent; it has no BitLocker/LAPS scopes, so key status is Unknown (delete needs -AllowKeyLoss).
-    Scopes (GraphCli): Report/-ReadOnly Device.Read.All; Disable/Delete/UI Directory.AccessAsUser.All (no narrower one);
-    key read BitlockerKey.ReadBasic.All + DeviceLocalCredential.ReadBasic.All; app-only Device.ReadWrite.All.
-    Role: Cloud Device Administrator (delete: Intune / Windows 365 Administrator); key read also needs a reader role.
-    Exit codes: 0 success, 1 error or failed action, 3 access denied, 4 sign-in/session error.
+    Author : Kasper Johansen, Apento (kmj@apento.com)
+    Version: 5.0.0 - 2026-11-24
+    Auth modes (no app registration):
+      GraphCli (default)  Microsoft Graph Command Line Tools; scopes need admin consent once.
+      UserRights          Azure PowerShell app (preconsented); access = your Entra roles; needs -TenantId.
+    Scopes (GraphCli): Report/-ReadOnly Device.Read.All; Disable/Delete/UI Directory.AccessAsUser.All;
+      key status BitlockerKey.ReadBasic.All + DeviceLocalCredential.ReadBasic.All; app-only Device.ReadWrite.All.
+      UserRights uses Directory.AccessAsUser.All only, so key status is Unknown (delete needs -AllowKeyLoss).
+    Roles: Cloud Device Administrator; delete also Intune or Windows 365 Administrator; key read needs a reader role.
+    Exit codes: 0 success | 1 error/failed action | 3 access denied | 4 sign-in/session error.
+    Changelog: 5.0.0 - rewrite: eligibility rules, key-loss protection, hardened UI, audit CSV, -ReadOnly, -AuthMode.
 #>
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
